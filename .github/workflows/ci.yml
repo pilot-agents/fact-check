@@ -1,59 +1,56 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 # 外部 action は commit SHA で固定する（タグは後から別のコミットへ差し替えられる）。
 # コメントの版は固定した SHA が指すタグ。
 jobs:
-  check:
+  verify:
+    name: Verify (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - "22"
+          - "24"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # pnpm の版は package.json の packageManager が決める（ここでは指定しない）。
-      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+      # pnpm を先に入れる。setup-node の cache: pnpm はこれが居ないと失敗する。
+      # 版は package.json の packageManager に従う。
+      - uses: pnpm/action-setup@d9184bf108216479bc5a137cc391f4d7b14c870b # v6.1.0
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: pnpm
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile
 
       - name: Install Chromium for Playwright
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: Typecheck
-        run: pnpm typecheck
+      - name: Type check
+        run: pnpm run typecheck
 
-      - name: Lint
-        run: pnpm lint
+      # lint → test → build → 混入検査（組み込みパターンのみ。pull_request からは secret に届かない）
+      # → e2e → パッケージ e2e。固有の語まで見る厳格モードの検査は publish.yml 側にある。
+      - name: Verify
+        run: pnpm run verify
 
-      - name: Unit tests
-        run: pnpm test
-
-      # 混入検査は npm パッケージの中身を見るので、必ずビルドの後に置く。
-      - name: Build
-        run: pnpm build
-
-      # pull_request からは Environment の secret に届かないので、禁止語リストは使わない。
-      # 固有の語まで見る厳格モードの検査は publish.yml 側にある。
-      - name: Leak check (built-in patterns only, no external denylist)
-        run: pnpm check:leaks
-
-      - name: End-to-end (MCP over stdio, local HTTP fixtures only)
-        run: pnpm e2e
-
-      - name: End-to-end (installed npm package)
-        run: pnpm e2e:package
-
-      - name: Show what would be published
+      - name: Pack dry run
         run: npm pack --dry-run

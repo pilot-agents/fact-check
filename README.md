@@ -325,23 +325,25 @@ npm publish          # prepublishOnly が typecheck → lint → test → build 
 
 | ワークフロー | いつ動くか | 何をするか |
 | --- | --- | --- |
-| `ci.yml` | `main` への push と pull request | typecheck → lint → test → **build** → 混入検査（**組み込みパターンのみ**）→ e2e → e2e:package → `npm pack --dry-run` |
-| `publish.yml` | `v0.1.0` のような `v*` タグの push | タグと `package.json` の version の一致を確認し、禁止語リストの secret を一時ファイルへ書き出して**厳格モードの混入検査**を通し、e2e を通してから `npm publish --provenance` |
+| `ci.yml` | `main` への push、pull request、手動実行 | Node 22 / 24 の両方で typecheck → `pnpm verify`（lint → test → build → 混入検査（**組み込みパターンのみ**）→ e2e → e2e:package）→ `npm pack --dry-run` |
+| `publish.yml` | GitHub Release を**公開**したとき | CI と同じ検証を通してから、Release のタグと `package.json` の version の一致を確認し、禁止語リストの secret を一時ファイルへ書き出して `npm publish`（`prepublishOnly` が**厳格モードの混入検査**を回す） |
 
-混入検査はどちらも `pnpm build` の後に独立した step として置いてあります（ビルド前に走らせると
-パッケージの中身を検査できないため）。`ci.yml` は pull request から secret に届かないので、
-禁止語リストを使わず組み込みパターンだけで走ります。step 名にもそう書いてあります。固有の語まで見るのは
-`publish.yml` の厳格モードです。
+混入検査は `pnpm build` の後に走ります（ビルド前に走らせるとパッケージの中身を検査できないため）。
+`ci.yml` は pull request から secret に届かないので、禁止語リストを使わず組み込みパターンだけで走ります。
+固有の語まで見るのは `publish.yml` の厳格モードです。
 
 外部 action は commit SHA で固定してあります（タグは差し替えられるため）。pnpm の版は
 `package.json` の `packageManager` が決めるので、ワークフロー側では指定しません。
 
-`publish.yml` を使うには、リポジトリの Settings → Environments に `npm` を作り、そこに次の 2 つの
-secret を登録します。
+npm への認証は **Trusted Publisher**（GitHub Actions の OIDC）で行い、長期トークンは持ちません。
+来歴証明（provenance）は `package.json` の `publishConfig.provenance` で有効化してあります。
+初回だけ、npm 側でパッケージの Settings → Trusted Publisher に GitHub Actions を登録します
+（organization `pilot-agents`、repository `fact-check`、workflow `publish.yml`）。
+
+リポジトリの secret は 1 つだけです。
 
 | secret | 中身 |
 | --- | --- |
-| `NPM_TOKEN` | npm の Granular Access Token（このパッケージへの publish 権限付き） |
 | `FACT_CHECK_LEAK_DENYLIST_CONTENT` | 禁止語リストの**中身**（1 行 1 語）。ワークフローが一時ファイルへ書き出して厳格モードの検査に渡します。ログには出しません |
 
 公開の手順は次のとおりです。
@@ -349,6 +351,7 @@ secret を登録します。
 ```bash
 npm version patch          # package.json の version を上げてコミットとタグを作る
 git push origin main --tags
+gh release create v0.1.1 --generate-notes   # Release を公開すると publish.yml が走る
 ```
 
 ## レポートの読み方
