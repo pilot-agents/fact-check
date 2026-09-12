@@ -103,6 +103,74 @@ command = "node"
 args = ["/absolute/path/to/fact-check/dist/index.js"]
 ```
 
+### ローカルのソースで試す（ホットリロード）
+
+`dist/` を作り直さず、**ローカルのソースのまま** クライアントに繋ぐ方法です。ソースを保存すると
+数百ミリ秒で中身が差し替わるので、「ツールを操作する → バグを見つける → ソースを直す → もう一度
+操作して確かめる」をクライアントを再起動せずに回せます。
+
+```bash
+pnpm install
+pnpm exec playwright install chromium   # ヘッドレスブラウザ（初回のみ）
+pnpm dev:mcp                            # 普段はクライアントが起動するので、手で叩く必要はありません
+```
+
+`pnpm dev:mcp` はクライアントとの接続を保ったまま、内側の実サーバー（既定 `tsx src/index.ts`）だけを
+入れ替える薄い前段です（`scripts/dev-mcp/`）。stdio の MCP サーバーはクライアントがプロセスを起動して
+繋ぎっぱなしにするため、素朴にプロセスを再起動すると接続が切れます（新しいプロセスは `initialize` を
+受け取っておらず、クライアントも送り直しません）。前段が `initialize` を覚えていて新しいプロセスに
+送り直すので、接続は切れません。
+
+| オプション | 既定 | 意味 |
+| --- | --- | --- |
+| `--server <コマンド>` | `tsx src/index.ts` | 内側で動かす実サーバー |
+| `--watch <ディレクトリ>` | `src` | 再帰的に監視して、変更で入れ替えるディレクトリ |
+
+#### `.mcp.json`（Claude Code のプロジェクトスコープ）
+
+```json
+{
+  "mcpServers": {
+    "fact-check-dev": {
+      "command": "pnpm",
+      "args": ["--silent", "dev:mcp"],
+      "env": { "FACT_CHECK_DIR": "/absolute/path/to/fact-check-data" }
+    }
+  }
+}
+```
+
+Claude Code はプロジェクトスコープの `.mcp.json` に書いたコマンドを、そのプロジェクトのディレクトリで
+起動します。だから `pnpm` と相対パスのままで動きます（この前提は `pnpm e2e:dev` が実際に
+`pnpm --silent dev:mcp` を cwd 指定で起動して確かめています）。`--silent` は pnpm 自身の出力が
+stdout に混ざらないようにするためです。`FACT_CHECK_DIR` はそのまま実サーバーに渡ります。
+
+#### Codex
+
+```toml
+[mcp_servers.fact-check-dev]
+command = "pnpm"
+args = ["--silent", "--dir", "/absolute/path/to/fact-check", "dev:mcp"]
+startup_timeout_sec = 120
+
+[mcp_servers.fact-check-dev.env]
+FACT_CHECK_DIR = "/absolute/path/to/fact-check-data"
+```
+
+#### 動きかた
+
+- ソースを保存すると、300ms ほど変更をまとめてから実サーバーを入れ替えます。入れ替えが終わると
+  `notifications/tools/list_changed` を送るので、ツール定義を変えたときはクライアントが取り直します
+- **入れ替えの瞬間に流れていた呼び出しはエラーになります**（`-32000`、本文に「サーバーを再起動したため
+  中断した」とどの method だったか）。同じ呼び出しをもう一度投げれば通ります
+- 入れ替え中に届いた呼び出しは溜めておき、新しいプロセスの初期化が済んでから順番どおりに流します
+- ソースに構文エラーがあると実サーバーは起動に失敗しますが、前段は生き続けます。その間の呼び出しは
+  `-32001`（子プロセスが起動していない旨）で返り、ソースを直して保存すると起動をやり直します
+- 失敗の理由は **stderr** に出ます。Claude Code では `/mcp` からサーバーの状態と stderr のログを見られます
+  （`fact-check-dev` を選ぶと、起動失敗のスタックトレースもそこに出ます）
+- `dist/` は関係ありません。`scripts/dev-mcp/` は `tsconfig.build.json` の対象外なので、`dist/` にも
+  npm パッケージにも入りません
+
 ### 共通の注意
 
 - MCP 接続（プロセス起動）でサーバーが立ち上がります。常駐サービスや別途起動するデーモンはありません
@@ -254,11 +322,13 @@ pnpm check:leaks   # 公開物の混入検査（下記。pnpm build の後に走
 pnpm test          # vitest（ユニットテスト）
 pnpm e2e           # build して、子プロセスの MCP サーバーに stdio で繋いで一連の流れを通す
 pnpm e2e:package   # npm pack した tarball を入れ直して、npm 経由でも動くかを見る
+pnpm e2e:dev       # ホットリロード用の前段（pnpm dev:mcp）を MCP クライアントから動かして確かめる
+pnpm dev:mcp       # ローカルのソースのままクライアントに繋ぐ（上記「ローカルのソースで試す」）
 pnpm viewer        # セッション一覧のローカルサーバーを起動する
 pnpm report:rebuild <session_dir>   # 既存セッションの report.html を今のビューアで作り直す
 ```
 
-`pnpm e2e` / `pnpm e2e:package` は外部サイトには一切アクセスしません。ローカルの HTTP サーバーが配る
+`pnpm e2e` / `pnpm e2e:package` / `pnpm e2e:dev` は外部サイトには一切アクセスしません。ローカルの HTTP サーバーが配る
 固定ページとローカルファイルだけを使います。
 
 ### 公開物の混入検査（`pnpm check:leaks`）

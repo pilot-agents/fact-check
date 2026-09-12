@@ -21,5 +21,8 @@
     // スクリプトまで dist/ に出て、公開物に入ってしまう。
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "e2e/**/*.ts", "scripts/**/*.ts", "vitest.config.ts"]
+  "include": ["src/**/*.ts", "e2e/**/*.ts", "scripts/**/*.ts", "vitest.config.ts"],
+  // e2e/tmp は e2e が実行時に書き出す作業場所。ホットリロードの e2e はそこへ架空のサーバーの
+  // ソースを置き、わざと構文エラーにする手順を含むので、型検査の対象に入れない。
+  "exclude": ["e2e/tmp"]
 }
