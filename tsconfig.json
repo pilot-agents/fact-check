@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    // このファイルは型検査だけに使う。出力の置き場所（outDir / rootDir / sourceMap）は
+    // tsconfig.build.json だけが持つ。ここに書くと、`tsc` を素で叩いただけでテストや
+    // スクリプトまで dist/ に出て、公開物に入ってしまう。
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "e2e/**/*.ts", "scripts/**/*.ts", "vitest.config.ts"]
+}

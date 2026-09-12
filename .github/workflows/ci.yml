@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 外部 action は commit SHA で固定する（タグは後から別のコミットへ差し替えられる）。
+# コメントの版は固定した SHA が指すタグ。
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # pnpm の版は package.json の packageManager が決める（ここでは指定しない）。
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for Playwright
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Unit tests
+        run: pnpm test
+
+      # 混入検査は npm パッケージの中身を見るので、必ずビルドの後に置く。
+      - name: Build
+        run: pnpm build
+
+      # pull_request からは Environment の secret に届かないので、禁止語リストは使わない。
+      # 固有の語まで見る厳格モードの検査は publish.yml 側にある。
+      - name: Leak check (built-in patterns only, no external denylist)
+        run: pnpm check:leaks
+
+      - name: End-to-end (MCP over stdio, local HTTP fixtures only)
+        run: pnpm e2e
+
+      - name: End-to-end (installed npm package)
+        run: pnpm e2e:package
+
+      - name: Show what would be published
+        run: npm pack --dry-run

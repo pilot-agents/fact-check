@@ -1,0 +1,13 @@
+{
+  // 公開する dist/ を作る設定。出力に関わる指定はここにだけ書く。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    // ソースマップはローカルの絶対パスを埋め込むので公開しない。
+    "sourceMap": false,
+    "noEmit": false
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
+}

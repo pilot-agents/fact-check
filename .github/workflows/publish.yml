@@ -1,0 +1,75 @@
+name: Publish to npm
+
+# v0.1.0 のようなタグを push すると公開する。
+# タグの版と package.json の version が一致しないときは公開しない。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write # npm provenance（公開物がこのワークフローから出たことの証明）に必要
+
+# 外部 action は commit SHA で固定する（タグは後から別のコミットへ差し替えられる）。
+# コメントの版は固定した SHA が指すタグ。
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: npm
+    env:
+      # 禁止語リストの置き場所。書き出す step と検査する step で同じパスを使う。
+      FACT_CHECK_LEAK_DENYLIST: ${{ runner.temp }}/leak-denylist.txt
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # pnpm の版は package.json の packageManager が決める（ここでは指定しない）。
+      - uses: pnpm/action-setup@a15d269cd4658e1107c09f1fabf4cbd7bd1f308a # v4.4.0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for Playwright
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Check that the tag matches package.json version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match package.json version $pkg" >&2
+            exit 1
+          fi
+
+      # 禁止語リストの中身を Environment の secret から一時ファイルへ書き出す。
+      # 中身は echo せず printf でファイルへ渡すだけにし、シェルのトレース（set -x）も使わない。
+      # 書き出しに失敗した・空だったときは、次の step が厳格モードで落ちる。
+      - name: Write the leak denylist from the environment secret
+        env:
+          DENYLIST_CONTENT: ${{ secrets.FACT_CHECK_LEAK_DENYLIST_CONTENT }}
+        run: printf '%s' "$DENYLIST_CONTENT" > "$FACT_CHECK_LEAK_DENYLIST"
+
+      # 混入検査は npm パッケージの中身を見るので、必ずビルドの後に置く。
+      - name: Build
+        run: pnpm build
+
+      # 厳格モード: 禁止語リストが未設定・読めない・語が 0 件なら落ちる。
+      - name: Leak check (strict, requires the denylist secret)
+        run: pnpm check:leaks --require-denylist
+
+      # typecheck / lint / test / build / 厳格モードの混入検査は prepublishOnly でも回る。
+      # e2e はここで別に回す（prepublishOnly には入れていない）
+      - name: End-to-end
+        run: pnpm e2e && pnpm e2e:package
+
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

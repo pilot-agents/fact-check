@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.fact-check/
+e2e/tmp/
+.mcp.json
+.claude/settings.local.json
