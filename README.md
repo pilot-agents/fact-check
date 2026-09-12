@@ -76,6 +76,8 @@ claude mcp add fact-check \
 [mcp_servers.fact-check]
 command = "npx"
 args = ["-y", "@pilot-agents/fact-check-mcp"]
+# npx は初回にパッケージと依存を取得するので、既定の起動待ちでは間に合わないことがある
+startup_timeout_sec = 120
 
 [mcp_servers.fact-check.env]
 FACT_CHECK_DIR = "/absolute/path/to/fact-check-data"
