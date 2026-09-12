@@ -18,9 +18,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: npm
-    env:
-      # 禁止語リストの置き場所。書き出す step と検査する step で同じパスを使う。
-      FACT_CHECK_LEAK_DENYLIST: ${{ runner.temp }}/leak-denylist.txt
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -51,10 +48,15 @@ jobs:
       # 禁止語リストの中身を Environment の secret から一時ファイルへ書き出す。
       # 中身は echo せず printf でファイルへ渡すだけにし、シェルのトレース（set -x）も使わない。
       # 書き出しに失敗した・空だったときは、次の step が厳格モードで落ちる。
+      # 置き場所（runner の一時ディレクトリ）は GITHUB_ENV 経由で後続の step に渡す。
+      # job 全体の env では runner コンテキストを参照できないため、ここで決める。
       - name: Write the leak denylist from the environment secret
         env:
           DENYLIST_CONTENT: ${{ secrets.FACT_CHECK_LEAK_DENYLIST_CONTENT }}
-        run: printf '%s' "$DENYLIST_CONTENT" > "$FACT_CHECK_LEAK_DENYLIST"
+        run: |
+          denylist="$RUNNER_TEMP/leak-denylist.txt"
+          printf '%s' "$DENYLIST_CONTENT" > "$denylist"
+          echo "FACT_CHECK_LEAK_DENYLIST=$denylist" >> "$GITHUB_ENV"
 
       # 混入検査は npm パッケージの中身を見るので、必ずビルドの後に置く。
       - name: Build
