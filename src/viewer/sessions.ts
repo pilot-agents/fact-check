@@ -1,8 +1,9 @@
 import type { Dirent } from 'node:fs'
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { describeCause, FactCheckError } from '../errors.js'
 import { parseJsonFile, parseLedgerLike } from '../session/ledger-like.js'
+import { fileExists } from '../session/ledger-store.js'
 import { type LedgerSummary, summarizeLedger } from '../session/ledger-summary.js'
 
 /**
@@ -22,8 +23,12 @@ export type SessionRow = {
   source: { kind: string; origin: string | null } | null
   ledger_version: number | null
   summary: LedgerSummary | null
-  /** report.html が既にあるか（finalize 済みか report:rebuild 済みか） */
-  finalized: boolean
+  /**
+   * report.html が既にあるか（finalize 済みか report:rebuild 済みか）。
+   * null は「確かめられなかった」— 有無を false に丸めると、権限エラーが
+   * 「まだ finalize していないセッション」に化ける。
+   */
+  finalized: boolean | null
   /** 台帳が読めなかったときの理由。読めていれば null */
   error: string | null
 }
@@ -51,9 +56,11 @@ function byNewestFirst(a: SessionRow, b: SessionRow): number {
 
 async function readSession(baseDir: string, id: string): Promise<SessionRow> {
   const directory = path.join(baseDir, id)
-  const finalized = await exists(path.join(directory, 'report.html'))
   const ledgerPath = path.join(directory, 'ledger.json')
+  // report.html の有無の確認も台帳の読み出しと同じ try に入れる。ENOENT 以外で失敗したら
+  // その理由を行に載せる（一覧全体を落とすと、無関係なセッションまで見えなくなる）。
   try {
+    const finalized = await fileExists(path.join(directory, 'report.html'))
     const ledger = parseLedgerLike(parseJsonFile(await readFile(ledgerPath, 'utf8'), ledgerPath), ledgerPath)
     return {
       id,
@@ -73,17 +80,9 @@ async function readSession(baseDir: string, id: string): Promise<SessionRow> {
       source: null,
       ledger_version: null,
       summary: null,
-      finalized,
+      // 確かめられていない以上「finalize 済みでない」とは言えない。null で区別する。
+      finalized: null,
       error: describeCause(cause),
     }
-  }
-}
-
-async function exists(filePath: string): Promise<boolean> {
-  try {
-    await stat(filePath)
-    return true
-  } catch {
-    return false
   }
 }

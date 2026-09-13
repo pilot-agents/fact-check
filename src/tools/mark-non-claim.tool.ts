@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { loadSourceText, updateLedger } from '../session/ledger-store.js'
 import { assertValidRange } from '../source-text/ranges.js'
 import { addNonClaim, coverageProgress } from './range-records.js'
-import { jsonResult, sessionIdInput } from './tool-context.js'
+import { assertSessionOpen, jsonResult, sessionIdInput } from './tool-context.js'
 
 const DESCRIPTION = [
   '元ネタの 1 範囲を「裏取り対象ではない」として登録する。見出し・感想・意見・接続句・空行など。',
@@ -27,6 +27,7 @@ export function registerMarkNonClaim(server: McpServer): void {
     },
     async ({ session_id, start, end, reason }) => {
       const result = await updateLedger(session_id, async (ledger) => {
+        assertSessionOpen(ledger)
         const sourceText = await loadSourceText(ledger)
         assertValidRange(sourceText.length, start, end, 'mark_non_claim の範囲')
         const record = addNonClaim(ledger, sourceText, { start, end, reason })

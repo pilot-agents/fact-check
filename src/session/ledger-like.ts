@@ -1,5 +1,6 @@
 import { FactCheckError } from '../errors.js'
-import type { Attachment, Claim, Evidence, NonClaim, SourceRecord } from './ledger-types.js'
+import { normalizeAddedFields } from './ledger-added-fields.js'
+import type { Attachment, Claim, Evidence, Exclusion, NonClaim, SourceRecord } from './ledger-types.js'
 
 /**
  * version を問わず「台帳の形をしているか」だけを確かめて読む経路。
@@ -13,12 +14,16 @@ import type { Attachment, Claim, Evidence, NonClaim, SourceRecord } from './ledg
  * 意味の分からない TypeError になる前に、どの項目がおかしいかを言って落とす。
  */
 
-/** version 1 の証拠には discovered_via / discovery_note / pdf が無い。 */
-export type EvidenceLike = Omit<Evidence, 'discovered_via' | 'discovery_note' | 'pdf'> &
-  Partial<Pick<Evidence, 'discovered_via' | 'discovery_note' | 'pdf'>>
+/** version 1 の証拠には discovered_via / discovery_note / pdf が無い。term_check は後から足した。 */
+export type EvidenceLike = Omit<Evidence, 'discovered_via' | 'discovery_note' | 'pdf' | 'term_check'> &
+  Partial<Pick<Evidence, 'discovered_via' | 'discovery_note' | 'pdf' | 'term_check'>>
 
-/** version 1 の紐づけには pdf_page が無い。 */
-export type AttachmentLike = Omit<Attachment, 'pdf_page'> & Partial<Pick<Attachment, 'pdf_page'>>
+/**
+ * version 1 の紐づけには pdf_page が無い。screenshot_source と screenshot_attempts は
+ * 後から足したので旧台帳には無い。
+ */
+export type AttachmentLike = Omit<Attachment, 'pdf_page' | 'screenshot_source' | 'screenshot_attempts'> &
+  Partial<Pick<Attachment, 'pdf_page' | 'screenshot_source' | 'screenshot_attempts'>>
 
 export type LedgerLike = {
   version: number
@@ -30,6 +35,9 @@ export type LedgerLike = {
   non_claims: NonClaim[]
   evidence: EvidenceLike[]
   attachments: AttachmentLike[]
+  /** 取り消し履歴を持たない台帳では無い。無いことは「取り消されていない」と読む */
+  exclusions?: Exclusion[]
+  reports_stale_since?: string | null
 }
 
 export function parseLedgerLike(value: unknown, filePath: string): LedgerLike {
@@ -47,6 +55,9 @@ export function parseLedgerLike(value: unknown, filePath: string): LedgerLike {
   if (problems.length > 0) {
     throw new FactCheckError(`台帳として読めない (path=${filePath}): ${problems.join(' / ')}`)
   }
+  // 後から足した項目の検証は MCP の本流と共有する。ここが緩いと、ツールが拒否した
+  // 壊れた台帳をビューアだけが平気で描く（取り消し履歴が空に見える）。
+  normalizeAddedFields(ledger, filePath)
   return ledger as unknown as LedgerLike
 }
 

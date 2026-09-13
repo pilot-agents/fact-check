@@ -25,7 +25,13 @@ jobs:
       fail-fast: false
       matrix:
         node-version:
+          # engines の 2 系統それぞれの**下限そのもの**と最新。"22" / "24" だけだとその系の
+          # 最新しか入らず、下限を誰も踏まないまま「通った」ことになる。
+          # 下限が 22.22.1 / 24.11.1 なのは、Node の Error 整形（util.inspect）が
+          # 読めない Error で例外を投げる挙動が、この 2 版で直っているため（実測で確認）。
+          - "22.22.1"
           - "22"
+          - "24.11.1"
           - "24"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

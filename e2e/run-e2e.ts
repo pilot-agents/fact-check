@@ -1,14 +1,15 @@
 import { spawn } from 'node:child_process'
-import { mkdir, readFile, rm, stat } from 'node:fs/promises'
-import { createServer } from 'node:http'
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { chromium } from 'playwright'
+import { chromium, type Page } from 'playwright'
 import { readEmbeddedJson } from '../src/report/rendering/embed-json.js'
 import type { ViewerPayload } from '../src/report/rendering/viewer-payload.js'
-import { buildSamplePdf } from './fixtures/build-sample-pdf.js'
+import { startFixtureServer } from './fixtures/serve-fixtures.js'
+import { extractInlineScript, jsSyntaxDiagnostics } from './js-syntax.js'
+import { callTool } from './mcp/call-tool.js'
 
 /**
  * end-to-end 検証。MCP サーバーを子プロセスとして stdio で起動し、実際のツール呼び出しだけで
@@ -43,8 +44,6 @@ const PDF_PAGES = [
   ['Overseas shipment summary', 'The overseas shipment totalled 412 units in the quarter.'],
 ]
 
-type ToolOutcome = { ok: boolean; text: string; data: Record<string, unknown> }
-
 let failures = 0
 
 function log(message: string): void {
@@ -60,39 +59,439 @@ function check(label: string, condition: boolean, detail: string): void {
   log(`  [NG] ${label} — ${detail}`)
 }
 
-async function callTool(client: Client, name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
-  const result = await client.callTool({ name, arguments: args })
-  const content = result.content as Array<{ type: string; text: string }>
-  const text = content.map((part) => part.text).join('\n')
-  const ok = result.isError !== true
-  return { ok, text, data: ok ? (JSON.parse(text) as Record<string, unknown>) : {} }
+const VERDICTS = ['contradicted', 'partially_verified', 'unverifiable', 'verified', 'none'] as const
+
+/**
+ * 判定フィルターの全 32 通り（5 種の ON/OFF）を回し、**画面が出している集合**と
+ * **フィルターから決まるはずの集合**が一致することを突き合わせる。
+ *
+ * 人が思いつく 2〜3 パターンだけを見ていると、「絞り込みで選択中の主張が消えたのに
+ * 詳細だけ前のまま残る」「空一覧で何も言わない」が通り抜ける。判定は 5 種しかないので全数で回せる。
+ */
+async function checkFilterMatrix(page: Page, claimCount: number): Promise<void> {
+  log('\n[11b] 判定フィルターの全 32 通り')
+  const failures: string[] = []
+  for (let bits = 0; bits < 1 << VERDICTS.length; bits += 1) {
+    await page.click('#chip-all')
+    const off: string[] = []
+    for (let n = 0; n < VERDICTS.length; n += 1) {
+      if ((bits & (1 << n)) !== 0) continue
+      off.push(VERDICTS[n] ?? '')
+      await page.click(`.chip[data-verdict="${VERDICTS[n]}"]`)
+    }
+    // 画面とは別の道筋で期待値を出す: 埋め込みデータの判定を数えるだけ。
+    const observed = await page.evaluate((offValues: string[]) => {
+      const raw = document.getElementById('fact-check-data')
+      const parsed = JSON.parse(raw?.textContent ?? '{}') as {
+        ledger: { claims: Array<{ id: string; verdict: { value: string } | null }> }
+      }
+      const expectedIds = parsed.ledger.claims
+        .filter((claim) => !offValues.includes(claim.verdict === null ? 'none' : claim.verdict.value))
+        .map((claim) => claim.id)
+      const navIds = Array.from(document.querySelectorAll('#nav-body .nav-item')).map((node) =>
+        node.getAttribute('data-claim'),
+      )
+      const detail = document.querySelector('#detail-body .claim-detail')
+      return {
+        expectedIds,
+        navIds,
+        selected: detail === null ? null : detail.getAttribute('data-claim'),
+        emptyShown: document.querySelector('#nav-body .empty') !== null,
+        position: document.getElementById('claim-position')?.textContent ?? '',
+        dimmed: document.querySelectorAll('#source-body .seg-claim.dim').length,
+      }
+    }, off)
+
+    const label = off.length === 0 ? '全 ON' : `OFF: ${off.join(',')}`
+    if (observed.navIds.join(',') !== observed.expectedIds.join(',')) {
+      failures.push(
+        `${label} — 一覧が期待と違う (${observed.navIds.length} 件 / 期待 ${observed.expectedIds.length} 件)`,
+      )
+      continue
+    }
+    if (observed.expectedIds.length === 0) {
+      if (!observed.emptyShown) failures.push(`${label} — 空一覧なのに空状態を出していない`)
+      if (observed.selected !== null)
+        failures.push(`${label} — 表示 0 件なのに詳細が残っている (${observed.selected})`)
+      if (observed.position !== `— / 0`) failures.push(`${label} — 位置表示が ${observed.position}`)
+      continue
+    }
+    if (observed.selected === null || !observed.expectedIds.includes(observed.selected)) {
+      failures.push(`${label} — 選択 ${String(observed.selected)} が表示中の主張に含まれない`)
+    }
+    const index = observed.expectedIds.indexOf(observed.selected ?? '')
+    if (observed.position !== `${index + 1} / ${observed.expectedIds.length}`) {
+      failures.push(`${label} — 位置表示 ${observed.position} が選択 (${index + 1}) と合わない`)
+    }
+    if (observed.dimmed !== claimCount - observed.expectedIds.length) {
+      failures.push(`${label} — 本文で薄くした数 ${observed.dimmed} が非表示件数と合わない`)
+    }
+  }
+  await page.click('#chip-all')
+  check(
+    'フィルター 32 通りで一覧・選択・位置・本文の塗りが食い違わない',
+    failures.length === 0,
+    failures.length === 0 ? '32 通りすべて一致' : failures.join(' / '),
+  )
 }
 
-async function startFixtureServer(): Promise<{ origin: string; close: () => Promise<void> }> {
-  const html = await readFile(path.join(HERE, 'fixtures', 'sample-article.html'), 'utf8')
-  const pdf = buildSamplePdf(PDF_PAGES)
-  const server = createServer((request, response) => {
-    if (request.url === '/article') {
-      response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
-      response.end(html)
-      return
+/**
+ * 絞り込み中の前後移動と印刷。
+ *
+ * 全件表示のままで前後移動を試すと「可視集合を見ずに全件を辿る」実装でも通ってしまう。
+ * 逆に印刷は**絞り込みを引き継いではいけない**（紙は全部が要る）。両方を同じ状態で見る。
+ */
+async function checkFilteredNavigationAndPrint(page: Page, claimCount: number): Promise<void> {
+  await page.click('#chip-all')
+  await page.click('.chip[data-verdict="verified"]')
+  const visible = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('#nav-body .nav-item')).map((node) =>
+      node.getAttribute('data-claim'),
+    ),
+  )
+  // 先頭から下へ、次に末尾から上へ歩く。端から始めて片方向だけ試すと、移動が端で止まるだけで
+  // 「非表示を跨ぐ」実装でも通ってしまう（実際にこの取り違えで変異を取り逃がした）。
+  const visited: string[] = []
+  await page.click('#nav-body .nav-item')
+  visited.push((await page.getAttribute('#detail-body .claim-detail', 'data-claim')) ?? '')
+  for (const key of ['j', 'k']) {
+    for (let n = 0; n < claimCount + 2; n += 1) {
+      await page.keyboard.press(key)
+      const current = await page.getAttribute('#detail-body .claim-detail', 'data-claim')
+      if (current !== null) visited.push(current)
     }
-    if (request.url === '/filing.pdf') {
-      response.writeHead(200, { 'content-type': 'application/pdf' })
-      response.end(pdf)
-      return
-    }
-    response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
-    response.end('not found')
-  })
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
-  const address = server.address()
-  if (address === null || typeof address === 'string')
-    throw new Error('固定ページ配信サーバーの待受アドレスが取れない')
-  return {
-    origin: `http://127.0.0.1:${address.port}`,
-    close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
   }
+  const strayed = visited.filter((id) => !visible.includes(id))
+  check(
+    '絞り込み中の前後移動は非表示の主張を選ばない',
+    visible.length > 0 && visible.length < claimCount && strayed.length === 0,
+    `表示 ${visible.length}/${claimCount} 件 / 訪れた先で非表示だったもの ${strayed.length} 件${strayed.length === 0 ? '' : `: ${strayed.join(',')}`}`,
+  )
+  check(
+    '印刷用の一覧は絞り込みを引き継がず全主張を出す',
+    (await page.locator('#printAll .print-claim').count()) === claimCount,
+    `印刷 ${await page.locator('#printAll .print-claim').count()} 件 / 画面 ${visible.length} 件`,
+  )
+  await page.click('#chip-all')
+}
+
+/**
+ * 印刷で「畳んである情報」が本当に紙に出るか。
+ *
+ * DOM に在る件数を数えるだけでは合格にならない（閉じた details の中身を出さないブラウザがある）。
+ * print メディアを当てたうえで、**閉じていた要素の中身が実際に描画されているか**を高さで見る。
+ * 併せて、印刷したせいで画面の開閉状態が変わらないことも確かめる。
+ */
+async function checkPrintRendering(
+  page: Page,
+  claimCount: number,
+  expected: { nonClaimCount: number; exclusionCount: number },
+): Promise<void> {
+  const before = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('details')).map((node) => node.open),
+  )
+  await page.emulateMedia({ media: 'print' })
+  // ページへ渡す関数の中に「名前の付く関数式」を書かないこと。tsx が __name で包み、
+  // ページ側で ReferenceError になる（この e2e も tsx で動くので同じ罠にかかる）。
+  //
+  // 見えているかの判定に getBoundingClientRect の高さを使わない。**閉じた details の中でも
+  // 高さは 0 にならない**ことを実測で確認した（閉/開ともに 20px）。高さで見ると、何も出ていない
+  // 紙でもテストが通ってしまう。checkVisibility() だけが閉じた details の中身を false と答える。
+  const printed = await page.evaluate(() => ({
+    claims: document.querySelectorAll('#printAll .print-claim').length,
+    failureTotal: document.querySelectorAll('#printAll details.failure pre').length,
+    failureTextShown: Array.from(document.querySelectorAll('#printAll details.failure pre')).filter((node) =>
+      node.checkVisibility(),
+    ).length,
+    moreTotal: document.querySelectorAll('#printAll details.more dl.kv').length,
+    moreShown: Array.from(document.querySelectorAll('#printAll details.more dl.kv')).filter((node) =>
+      node.checkVisibility(),
+    ).length,
+    quoteTotal: document.querySelectorAll('#printAll details.more blockquote').length,
+    quoteShown: Array.from(document.querySelectorAll('#printAll details.more blockquote')).filter((node) =>
+      node.checkVisibility(),
+    ).length,
+    // report.md には全件ある「対象外とした範囲」が、紙には 1 件も出ていなかった。
+    // 数えるだけでなく checkVisibility() で「本当に見えているか」を見る。
+    nonClaimTotal: document.querySelectorAll('#printAll .print-nonclaim').length,
+    nonClaimShown: Array.from(document.querySelectorAll('#printAll .print-nonclaim blockquote')).filter(
+      (node) => node.checkVisibility(),
+    ).length,
+    exclusionTotal: document.querySelectorAll('#printAll .exclusion').length,
+    exclusionShown: Array.from(document.querySelectorAll('#printAll .exclusion dl.kv')).filter((node) =>
+      node.checkVisibility(),
+    ).length,
+    // 主張ごとの記録にも dl.kv があるので、セッションの管理情報は #printAll の直下だけを見る
+    // （どれか 1 つでも見えていればよい、にすると主張側の kv で通ってしまう）。
+    sessionMetaShown: Array.from(document.querySelectorAll('#printAll > dl.kv')).some((node) =>
+      node.checkVisibility(),
+    ),
+    layoutHidden: document.querySelector('.layout')?.checkVisibility() !== true,
+  }))
+  await page.emulateMedia({ media: 'screen' })
+  const after = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('details')).map((node) => node.open),
+  )
+
+  check(
+    '印刷に全主張が出る',
+    printed.claims === claimCount && printed.layoutHidden,
+    `${printed.claims} / ${claimCount} 件（画面用の 3 領域は紙では隠れる: ${printed.layoutHidden}）`,
+  )
+  check(
+    '印刷で管理情報（元ネタの該当文・証拠の記録）が実際に見える',
+    printed.moreTotal > 0 &&
+      printed.moreShown === printed.moreTotal &&
+      printed.quoteTotal > 0 &&
+      printed.quoteShown === printed.quoteTotal,
+    `記録 ${printed.moreShown} / ${printed.moreTotal} 件・該当文 ${printed.quoteShown} / ${printed.quoteTotal} 件`,
+  )
+  check(
+    '印刷に失敗の全文が出る',
+    printed.failureTotal > 0 && printed.failureTextShown === printed.failureTotal,
+    `${printed.failureTextShown} / ${printed.failureTotal} 件`,
+  )
+  check('印刷にセッションの詳細が出る', printed.sessionMetaShown, '表題の全文・id・生成時刻が紙にも残る')
+  check(
+    '印刷に対象外とした範囲が全件、本文つきで出る',
+    printed.nonClaimTotal === expected.nonClaimCount && printed.nonClaimShown === expected.nonClaimCount,
+    `${printed.nonClaimShown} / ${expected.nonClaimCount} 件（report.md の「対象外とした範囲」と同じ件数）`,
+  )
+  check(
+    '印刷に取り消し履歴が全件出る',
+    printed.exclusionTotal === expected.exclusionCount && printed.exclusionShown === expected.exclusionCount,
+    `${printed.exclusionShown} / ${expected.exclusionCount} 件`,
+  )
+  check(
+    '印刷しても画面の開閉状態は変わらない',
+    before.join(',') === after.join(','),
+    `開いていた details ${before.filter(Boolean).length} 個 → ${after.filter(Boolean).length} 個`,
+  )
+}
+
+/**
+ * 選んだ主張が**本文の枠の中に実際に見えている**こと。
+ * data-claim が一致しているだけでは、枠の外にあっても通ってしまう。
+ */
+async function checkSelectionIsVisible(page: Page, claimIds: readonly string[]): Promise<void> {
+  const failures: string[] = []
+  for (const id of claimIds) {
+    await page.click(`#nav-body .nav-item[data-claim="${id}"]`)
+    const visible = await page.evaluate((claimId: string) => {
+      const body = document.getElementById('source-body')
+      const target = body?.querySelector(`.seg-claim[data-claim="${claimId}"]`)
+      if (!body || !target) return { found: false, inside: false, top: 0, bodyTop: 0, bodyBottom: 0 }
+      const b = body.getBoundingClientRect()
+      const t = target.getBoundingClientRect()
+      return {
+        found: true,
+        inside: t.bottom > b.top && t.top < b.bottom,
+        top: Math.round(t.top),
+        bodyTop: Math.round(b.top),
+        bodyBottom: Math.round(b.bottom),
+      }
+    }, id)
+    if (!visible.found || !visible.inside) {
+      failures.push(
+        `${id}: 本文 [${visible.bodyTop}, ${visible.bodyBottom}] に対し該当箇所 top=${visible.top}`,
+      )
+    }
+  }
+  check(
+    '一覧で選んだ主張が本文の枠の中に見えている',
+    failures.length === 0,
+    failures.length === 0 ? `${claimIds.length} 件すべて枠内` : failures.join(' / '),
+  )
+}
+
+/** 枠の下端が画面の中に収まっていること（上部の高さを引き算しないレイアウトの回帰確認）。 */
+async function checkPanesFitViewport(page: Page, width: number, height: number): Promise<void> {
+  await page.setViewportSize({ width, height })
+  const box = await page.evaluate(() => {
+    const rects = Array.from(document.querySelectorAll('.layout .pane')).map((node) => {
+      const r = node.getBoundingClientRect()
+      return { top: Math.round(r.top), bottom: Math.round(r.bottom) }
+    })
+    return {
+      rects,
+      innerHeight: window.innerHeight,
+      pageScrollHeight: document.documentElement.scrollHeight,
+      horizontal: document.documentElement.scrollWidth > window.innerWidth,
+    }
+  })
+  const overflowing = box.rects.filter((r) => r.bottom > box.innerHeight)
+  check(
+    `${width}x${height} で 3 領域の下端が画面に収まる`,
+    overflowing.length === 0 && box.pageScrollHeight <= box.innerHeight + 1 && !box.horizontal,
+    `枠の下端 ${box.rects.map((r) => r.bottom).join(',')} / 画面 ${box.innerHeight} / ページ高 ${box.pageScrollHeight} / 横溢れ ${box.horizontal}`,
+  )
+}
+
+/** 前後移動の境界。先頭で「前」、最後で「次」が押せないこと。 */
+async function checkStepperBoundaries(page: Page, claimCount: number): Promise<void> {
+  const cases = [
+    { name: '先頭', key: 'k', repeat: claimCount + 2, disabled: '#prev-claim', enabled: '#next-claim' },
+    { name: '最後', key: 'j', repeat: claimCount + 2, disabled: '#next-claim', enabled: '#prev-claim' },
+  ]
+  for (const item of cases) {
+    await page.click('#chip-all')
+    for (let n = 0; n < item.repeat; n += 1) await page.keyboard.press(item.key)
+    check(
+      `${item.name}の主張では片側のボタンだけが無効になる`,
+      (await page.isDisabled(item.disabled)) && !(await page.isDisabled(item.enabled)),
+      `${item.disabled}=disabled / 位置 ${await page.innerText('#claim-position')}`,
+    )
+  }
+}
+
+/** 入力欄にいる間は j / k を横取りしない（選択が飛ぶと文字が打てない）。 */
+async function checkTypingDoesNotStealKeys(page: Page): Promise<void> {
+  // 先頭の主張を選んでから j だけを押す。j と k を往復させると、横取りされていても
+  // 行って戻るだけで同じ主張に落ち着き、素通しと見分けが付かない。
+  await page.click('#chip-all')
+  await page.click('#nav-body .nav-item')
+  const before = await page.getAttribute('#detail-body .claim-detail', 'data-claim')
+  const typed = await page.evaluate(() => {
+    const field = document.createElement('input')
+    field.id = 'e2e-typing-probe'
+    document.body.appendChild(field)
+    field.focus()
+    return document.activeElement === field
+  })
+  await page.keyboard.press('j')
+  const after = await page.getAttribute('#detail-body .claim-detail', 'data-claim')
+  await page.evaluate(() => document.getElementById('e2e-typing-probe')?.remove())
+  // 素通しできていることの裏取り: 同じ位置でフォーカスを外して j を押せば必ず動く。
+  await page.click('#nav-body .nav-item')
+  await page.keyboard.press('j')
+  const movedWhenNotTyping = (await page.getAttribute('#detail-body .claim-detail', 'data-claim')) !== before
+  check(
+    '入力欄にフォーカスがある間は j で選択が動かない（外すと動く）',
+    typed && before === after && movedWhenNotTyping,
+    `入力中 ${String(before)} → ${String(after)} / 入力外で移動=${movedWhenNotTyping}`,
+  )
+}
+
+/** 画像の原寸表示: ボタンで開き、閉じるボタンと Escape で閉じ、フォーカスが戻る。 */
+/**
+ * キーボードと読み上げのための構造を、実際に Tab を押して確かめる。
+ *
+ * 「focusable な要素が n 個ある」を数えるだけでは足りない。実測では本文の主張が
+ * focusable 0 / 15 件で、一覧のボタンを 15 個通らないと詳細へ行けなかった。
+ * ここでは Tab を実際に送り、飛べること・押せること・読み上げが出ることを見る。
+ */
+async function checkKeyboardAndAria(page: Page, claimIds: readonly string[]): Promise<void> {
+  // Tab の順序を先頭から見るには、フォーカスの起点を本当に先頭へ戻す必要がある。
+  // blur() では Chromium の「次にどこから Tab するか」の起点が戻らない（実測: 直前に
+  // 触れたチップの次から始まった）。読み込み直すのが一番確実で、状態も持ち越さない。
+  await page.reload({ waitUntil: 'load' })
+  await page.keyboard.press('Tab')
+  const firstStop = await page.evaluate(() => ({
+    className: document.activeElement?.className ?? '',
+    text: document.activeElement?.textContent ?? '',
+  }))
+  check(
+    'Tab の 1 つ目がスキップリンクになる',
+    firstStop.className.includes('skip-link'),
+    `class=${firstStop.className} / ${firstStop.text}`,
+  )
+  await page.keyboard.press('Tab')
+  await page.keyboard.press('Enter')
+  const jumped = await page.evaluate(() => document.activeElement?.id ?? '')
+  check(
+    'スキップリンクで詳細ペインへ直接飛べる（一覧のボタンを全部通らない）',
+    jumped === 'detail-body',
+    `飛び先の id=${jumped}`,
+  )
+
+  const structure = await page.evaluate(() => ({
+    headings: Array.from(document.querySelectorAll('h2[id]')).map((node) => node.id),
+    liveRegions: document.querySelectorAll('[aria-live]').length,
+    sourceClaimsTotal: document.querySelectorAll('#source-body .seg-claim').length,
+    sourceClaimsFocusable: document.querySelectorAll('#source-body .seg-claim[tabindex="0"]').length,
+    labelled: document.querySelectorAll('.pane[aria-labelledby]').length,
+  }))
+  check(
+    '3 領域に h2 の見出しがあり、領域と結ばれている',
+    structure.headings.length === 3 && structure.labelled === 3,
+    `見出し=${structure.headings.join(', ')} / aria-labelledby=${structure.labelled}`,
+  )
+  check(
+    '本文の主張がキーボードで到達できる',
+    structure.sourceClaimsTotal > 0 && structure.sourceClaimsFocusable === structure.sourceClaimsTotal,
+    `${structure.sourceClaimsFocusable} / ${structure.sourceClaimsTotal} 件`,
+  )
+  check(
+    '選択を知らせる読み上げ領域がちょうど 1 つある（詳細全体を読み上げさせない）',
+    structure.liveRegions === 1,
+    `aria-live の数=${structure.liveRegions}`,
+  )
+
+  // 本文の主張を Enter と Space で選べること。押すたびに読み上げ通知が更新されること。
+  for (const [index, key] of ['Enter', ' '].entries()) {
+    const target = claimIds[index]
+    if (target === undefined) continue
+    await page.focus(`#source-body .seg-claim[data-claim="${target}"]`)
+    await page.evaluate(() => {
+      const live = document.getElementById('selection-live')
+      if (live !== null) live.textContent = ''
+    })
+    await page.keyboard.press(key === ' ' ? 'Space' : key)
+    const selected = await page.getAttribute('#detail-body .claim-detail', 'data-claim')
+    const announced = await page.innerText('#selection-live')
+    check(
+      `本文の主張を ${key === ' ' ? 'Space' : key} で選べる`,
+      selected === target,
+      `選択=${String(selected)} / 期待=${target}`,
+    )
+    check(
+      `${key === ' ' ? 'Space' : key} での選択が短く読み上げられる`,
+      announced.includes('件目を選択') && announced.length < 120,
+      `読み上げ文（${announced.length} 文字）= ${announced}`,
+    )
+  }
+  // 詳細ペイン全体が aria-live になっていないこと（なっていると証拠の全文が読み上げられる）。
+  check(
+    '詳細ペイン自体は読み上げの生きた領域にしない',
+    (await page.locator('#detail-body[aria-live]').count()) === 0,
+    '#detail-body に aria-live は付いていない',
+  )
+}
+
+async function checkLightbox(page: Page): Promise<void> {
+  await page.click('#chip-all')
+  await page.click('#nav-body .nav-item')
+  const zoom = page.locator('#detail-body .shot-zoom').first()
+  if ((await zoom.count()) === 0) {
+    check(
+      '画像の原寸表示を開くボタンがある',
+      false,
+      '詳細に画像が無い（この e2e は画像を持つ claim を先に選ぶ想定）',
+    )
+    return
+  }
+  await zoom.focus()
+  await zoom.press('Enter')
+  check(
+    'キーボードから原寸表示を開ける',
+    (await page.locator('#lightbox[open]').count()) === 1,
+    `dialog open=${await page.locator('#lightbox[open]').count()}`,
+  )
+  await page.click('#lightbox-close')
+  check(
+    '閉じるボタンで閉じ、開いたボタンへフォーカスが戻る',
+    (await page.locator('#lightbox[open]').count()) === 0 &&
+      (await page.evaluate(() => document.activeElement?.className ?? '')).includes('shot-zoom'),
+    `open=${await page.locator('#lightbox[open]').count()} / focus=${await page.evaluate(() => document.activeElement?.className ?? '')}`,
+  )
+  await zoom.press('Enter')
+  await page.keyboard.press('Escape')
+  check(
+    'Escape で閉じ、フォーカスが戻る',
+    (await page.locator('#lightbox[open]').count()) === 0 &&
+      (await page.evaluate(() => document.activeElement?.className ?? '')).includes('shot-zoom'),
+    `open=${await page.locator('#lightbox[open]').count()}`,
+  )
 }
 
 /**
@@ -108,8 +507,28 @@ async function checkViewerPage(
     verifiedClaim: string
     screenshotPath: string
     claimCount: number
+    nonClaimCount: number
+    exclusionCount: number
   },
 ): Promise<void> {
+  // ブラウザを起こす前に、**生成後の** report.html から描画コードを取り出して構文検査する。
+  // ブラウザの pageerror は、インライン script の構文エラーだと `Unexpected token ')'` の
+  // 1 行だけで stack が空になる（実測）。どの行かはパーサでないと出ない。
+  // 単体テストはテンプレートの中身を見ているが、こちらは埋め込み・エスケープを通した後の
+  // 実物を見るので、生成の段で壊れた場合もここで捕まる。
+  const generatedHtml = await readFile(htmlPath, 'utf8')
+  const generatedScript = extractInlineScript(generatedHtml)
+  if (generatedScript === null) {
+    check('report.html に描画コードが埋め込まれている', false, '<script> が見つからない')
+  } else {
+    const diagnostics = jsSyntaxDiagnostics(generatedScript, 'report.html の描画コード')
+    check(
+      '生成後の描画コードが JavaScript として構文が通る',
+      diagnostics.length === 0,
+      diagnostics.join('\n') || `${generatedScript.length} 文字・構文エラーなし`,
+    )
+  }
+
   const browser = await chromium.launch({ headless: true })
   try {
     const context = await browser.newContext({ viewport: { width: 1400, height: 900 } })
@@ -118,19 +537,47 @@ async function checkViewerPage(
     page.on('console', (message) => {
       if (message.type() === 'error') consoleErrors.push(message.text())
     })
-    page.on('pageerror', (error) => consoleErrors.push(`pageerror: ${error.message}`))
+    // **stack まで残す。** message だけだと `Unexpected token ')'` の 1 行しか出ず、
+    // どこで死んだのかが分からない。全文を持っておいて、失敗したときにそのまま出す。
+    page.on('pageerror', (error) => {
+      consoleErrors.push(`pageerror: ${error.message}\n${error.stack ?? '(stack なし)'}`)
+    })
     await page.goto(pathToFileURL(htmlPath).href, { waitUntil: 'load' })
+    // 描画コードが例外で死んでいると、以下の検査は全部「0 件」になり、そのあと
+    // 要素待ちで 30 秒タイムアウトして落ちる。**原因より先にタイムアウトが出る**ので、
+    // ここで例外そのものを出し、続きの検査には進まない。
+    // （ビューアの JS は TS のテンプレート文字列なので、構文エラーは tsc では捕まらない。
+    //  同じものを src/report/rendering/viewer-script.test.ts が TypeScript のパーサで
+    //  先に検査しているが、そこを抜けた実行時例外はここが最後の砦になる。）
+    const rendered = consoleErrors.length === 0
+    check('ビューアの描画コードが例外なく走る', rendered, consoleErrors.join('\n---\n') || 'エラーなし')
+    if (!rendered) {
+      log('  描画が死んでいるので、以降のビューア検査は行わない（原因は上の全文）')
+      await context.close()
+      return
+    }
 
-    const attentionRow = page.locator(`.attention-row[data-claim="${expected.partiallyVerifiedClaim}"]`)
     check(
-      '要確認一覧に partially_verified の claim が出る',
-      (await attentionRow.count()) === 1 && (await attentionRow.innerText()).includes('一部のみ裏取り'),
-      `${expected.partiallyVerifiedClaim} / 一覧 ${await page.locator('.attention-row').count()} 行`,
+      '主張一覧に全主張が出る（verified も含めて辿り着ける）',
+      (await page.locator('#nav-body .nav-item').count()) === expected.claimCount &&
+        (await page.locator(`#nav-body .nav-item[data-claim="${expected.verifiedClaim}"]`).count()) === 1,
+      `${await page.locator('#nav-body .nav-item').count()} 件 / ${expected.claimCount} 件`,
     )
     check(
-      '要確認一覧に verified の claim は出ない',
-      (await page.locator(`.attention-row[data-claim="${expected.verifiedClaim}"]`).count()) === 0,
-      expected.verifiedClaim,
+      '要確認の主張には印が付き、verified には付かない',
+      (await page
+        .locator(`#nav-body .nav-item[data-claim="${expected.partiallyVerifiedClaim}"] .nav-flag`)
+        .count()) === 1 &&
+        (await page
+          .locator(`#nav-body .nav-item[data-claim="${expected.verifiedClaim}"] .nav-flag`)
+          .count()) === 0,
+      `要確認の印 ${await page.locator('#nav-body .nav-flag').count()} 件`,
+    )
+    check(
+      '上部から巨大な要確認表が消えている',
+      (await page.locator('.attention-row').count()) === 0 &&
+        (await page.locator('#attention-list').count()) === 0,
+      '主張一覧に一本化されている',
     )
 
     await page.click(`#source-body .seg-claim[data-claim="${expected.verifiedClaim}"]`)
@@ -160,51 +607,76 @@ async function checkViewerPage(
       shotSrc === expected.screenshotPath && shotLoadProblem === null,
       `src=${String(shotSrc)} / 読み込み=${shotLoadProblem ?? '成功'}`,
     )
+    // 管理情報は初期表示では畳んである（innerText に出ない）。開くと読める、が守りたい振る舞い。
+    const metaHiddenAtFirst = !(await page.innerText('#detail-body')).includes('本文 sha256')
+    const summaries = page.locator('#detail-body details.more > summary')
+    const summaryCount = await summaries.count()
+    for (let n = 0; n < summaryCount; n += 1) await summaries.nth(n).click()
     check(
-      '詳細に証拠の出どころと sha256 が出る',
-      (await page.innerText('#detail-body')).includes('本文 sha256'),
-      '出どころ・取得時刻・sha256 の欄がある',
+      '管理情報は初期は畳まれ、開くと sha256 まで読める',
+      metaHiddenAtFirst && summaryCount > 0 && (await page.innerText('#detail-body')).includes('本文 sha256'),
+      `初期は非表示=${metaHiddenAtFirst} / details ${summaryCount} 個`,
     )
 
-    const coloredBefore = await page.locator('#source-body .seg-claim:not(.dim)').count()
-    await page.click('.chip[data-verdict="verified"]')
-    const coloredAfter = await page.locator('#source-body .seg-claim:not(.dim)').count()
-    const dimmed = await page.locator('#source-body .seg-claim.dim').count()
+    await page.click(`#nav-body .nav-item[data-claim="${expected.partiallyVerifiedClaim}"]`)
     check(
-      '判定で絞り込むと左ペインの塗りが変わる',
-      coloredBefore === expected.claimCount && coloredAfter < coloredBefore && dimmed > 0,
-      `塗り ${coloredBefore} → ${coloredAfter} 件（薄くした範囲 ${dimmed} 件）`,
+      '主張一覧をクリックすると詳細と本文の選択が揃う',
+      (await page.getAttribute('#detail-body .claim-detail', 'data-claim')) ===
+        expected.partiallyVerifiedClaim &&
+        (await page
+          .locator(`#source-body .seg-claim.selected[data-claim="${expected.partiallyVerifiedClaim}"]`)
+          .count()) > 0 &&
+        (await page
+          .locator(
+            `#nav-body .nav-item[aria-current="true"][data-claim="${expected.partiallyVerifiedClaim}"]`,
+          )
+          .count()) === 1,
+      expected.partiallyVerifiedClaim,
     )
-    const rowsBefore = await page.locator('.attention-row').count()
-    await page.click('.chip[data-verdict="partially_verified"]')
-    const rowsAfter = await page.locator('.attention-row').count()
-    check(
-      '絞り込みは要確認一覧にも効く',
-      rowsBefore === 2 &&
-        rowsAfter === 1 &&
-        (await page.locator(`.attention-row[data-claim="${expected.partiallyVerifiedClaim}"]`).count()) === 0,
-      `${rowsBefore} 行 → ${rowsAfter} 行`,
-    )
+
+    await checkFilterMatrix(page, expected.claimCount)
+
     await page.click('#chip-all')
-    check(
-      '「すべて表示」で絞り込みが元に戻る',
-      (await page.locator('.attention-row').count()) === 2 &&
-        (await page.locator('#source-body .seg-claim.dim').count()) === 0,
-      `${await page.locator('.attention-row').count()} 行`,
-    )
-
     await page.click(`#source-body .seg-claim[data-claim="${expected.verifiedClaim}"]`)
+    const positionBefore = await page.innerText('#claim-position')
     await page.keyboard.press('j')
     const afterKey = await page.getAttribute('#detail-body .claim-detail', 'data-claim')
     check(
-      'j キーで次の claim に移動する',
-      afterKey !== null && afterKey !== expected.verifiedClaim,
-      `${expected.verifiedClaim} → ${String(afterKey)}`,
+      'j キーで次の claim に移動し、位置表示も進む',
+      afterKey !== null &&
+        afterKey !== expected.verifiedClaim &&
+        (await page.innerText('#claim-position')) !== positionBefore,
+      `${expected.verifiedClaim} → ${String(afterKey)} / 位置 ${positionBefore} → ${await page.innerText('#claim-position')}`,
     )
+    await page.click('#prev-claim')
+    check(
+      '「前」ボタンで戻る',
+      (await page.getAttribute('#detail-body .claim-detail', 'data-claim')) === expected.verifiedClaim &&
+        (await page.innerText('#claim-position')) === positionBefore,
+      `位置 ${await page.innerText('#claim-position')}`,
+    )
+
+    await checkStepperBoundaries(page, expected.claimCount)
+    await checkFilteredNavigationAndPrint(page, expected.claimCount)
+    await checkSelectionIsVisible(page, [expected.verifiedClaim, expected.partiallyVerifiedClaim])
+    await checkPrintRendering(page, expected.claimCount, {
+      nonClaimCount: expected.nonClaimCount,
+      exclusionCount: expected.exclusionCount,
+    })
+    for (const size of [
+      { width: 1440, height: 900 },
+      { width: 1920, height: 1080 },
+    ]) {
+      await checkPanesFitViewport(page, size.width, size.height)
+    }
+    await page.setViewportSize({ width: 1400, height: 900 })
+    await checkTypingDoesNotStealKeys(page)
+    await checkKeyboardAndAria(page, [expected.verifiedClaim, expected.partiallyVerifiedClaim])
+    await checkLightbox(page)
 
     check(
       'AI 提出の証拠に警告が出る',
-      (await page.innerText('#global-warn')).includes('AI が提出した証拠が 1 件あります'),
+      (await page.innerText('#global-warn')).includes('AI が提出した証拠が 2 件あります'),
       await page.innerText('#global-warn'),
     )
     check(
@@ -293,9 +765,9 @@ async function main(): Promise<void> {
   await rm(WORK_DIR, { recursive: true, force: true })
   await mkdir(WORK_DIR, { recursive: true })
 
-  const fixture = await startFixtureServer()
-  const articleUrl = `${fixture.origin}/article`
-  const pdfUrl = `${fixture.origin}/filing.pdf`
+  const fixture = await startFixtureServer(PDF_PAGES)
+  const articleUrl = fixture.articleUrl
+  const pdfUrl = fixture.pdfUrl
   log(`固定ページ配信サーバー: ${articleUrl} / ${pdfUrl}`)
 
   const transport = new StdioClientTransport({
@@ -320,8 +792,10 @@ async function main(): Promise<void> {
           'finalize',
           'get_status',
           'mark_non_claim',
+          'read_source_segments',
           'register_claim',
           'register_segments',
+          'revise_record',
           'set_verdict',
           'start_session',
           'submit_agent_capture',
@@ -608,6 +1082,126 @@ async function main(): Promise<void> {
       capturedAttach.ok,
       capturedAttach.ok ? '' : capturedAttach.text,
     )
+    check(
+      'AI 提出の画像は出どころが agent_captured のままになる',
+      capturedAttach.data.screenshot_source === null,
+      `screenshot_source=${String(capturedAttach.data.screenshot_source)}（画像の提出が無い証拠なので null）`,
+    )
+
+    log('\n[6e] expected_terms の照合')
+    const missingTerms = await callTool(client, 'submit_agent_capture', {
+      session_id: sessionId,
+      url: `${fixture.origin}/agent-only-2`,
+      text: AGENT_CAPTURED_TEXT,
+      discovered_via: 'agent_search',
+      expected_terms: ['国内の新規契約', '海外向けの出荷'],
+      note: '本文の抽出に失敗していないかを expected_terms で確かめる（架空）',
+    })
+    check('expected_terms を付けても登録できる', missingTerms.ok, missingTerms.ok ? '' : missingTerms.text)
+    const termCheck = missingTerms.data.expected_terms as { checked: boolean; missing: string[] }
+    check(
+      '本文に無い語が missing として返る',
+      termCheck.checked === true && termCheck.missing.join(',') === '海外向けの出荷',
+      `checked=${String(termCheck.checked)} / missing=[${termCheck.missing.join(', ')}]`,
+    )
+
+    log('\n[6f] 取得元を止めてから画像を作る（保存済みスナップショットから描く）')
+    await fixture.close()
+    log(`固定ページ配信サーバーを停止した: ${articleUrl}`)
+    const offlineFetch = await fetch(articleUrl).then(
+      () => 'まだ応答している',
+      () => '接続できない',
+    )
+    check('取得元がもう応答しない', offlineFetch === '接続できない', offlineFetch)
+    const offlineAttach = await callTool(client, 'attach_evidence', {
+      session_id: sessionId,
+      claim_id: claimA.data.claim_id,
+      evidence_id: evidenceId,
+      quote: 'The overseas shipment totalled 412 units in the quarter.',
+      relation: 'supports',
+      rationale: '取得元が落ちていても、保存済みスナップショットから画像を作れることの確認',
+    })
+    check(
+      '取得元が落ちていても画像が作れる',
+      offlineAttach.ok &&
+        typeof offlineAttach.data.screenshot_path === 'string' &&
+        offlineAttach.data.screenshot_note === null,
+      `${String(offlineAttach.data.screenshot_path)} / 但し書き=${String(offlineAttach.data.screenshot_note)}`,
+    )
+    check(
+      '画像の出どころが保存済み HTML と記録される',
+      offlineAttach.data.screenshot_source === 'saved_html',
+      String(offlineAttach.data.screenshot_source),
+    )
+    check(
+      '成功した画像には失敗用の但し書きが付かない',
+      goodAttach.data.screenshot_source === 'saved_html' && goodAttach.data.screenshot_note === null,
+      `screenshot_source=${String(goodAttach.data.screenshot_source)} / 但し書き=${String(goodAttach.data.screenshot_note)}`,
+    )
+    check(
+      'PDF の画像は出どころが pdf_page になる',
+      pdfAttach.data.screenshot_source === 'pdf_page',
+      String(pdfAttach.data.screenshot_source),
+    )
+
+    log('\n[6g] 保存 HTML で描けない引用は、保存した抽出本文を描いて撮り直す')
+    // 固定ページが自分で隠している一節。抽出本文には出るが、保存 HTML を描いた DOM では
+    // 描画矩形が取れない。実データの 35 件中 3 件がこの形だった。
+    // **ツール側で display:none を解除することはしない。** 代わりに、取得時に保存した
+    // 抽出本文のほうを描いて引用箇所を示す（外部にも当たらない）。
+    const fallbackAttach = await callTool(client, 'attach_evidence', {
+      session_id: sessionId,
+      claim_id: claimA.data.claim_id,
+      evidence_id: evidenceId,
+      quote: 'The deferred note records 87 exceptions handled during the quarter.',
+      relation: 'partial',
+      rationale: 'ページ自身が隠している一節（保存 HTML では描画矩形が取れない）',
+    })
+    check(
+      '折りたたみの中の引用でも添付は通る',
+      fallbackAttach.ok,
+      fallbackAttach.ok ? '' : fallbackAttach.text,
+    )
+    const fallbackAttempts = fallbackAttach.data.screenshot_attempts as Array<{
+      source: string
+      path: string | null
+      highlighted: boolean
+      note: string | null
+      adopted: boolean
+    }>
+    check(
+      '保存 HTML では撮れず、保存した抽出本文で撮り直している',
+      fallbackAttach.data.screenshot_source === 'saved_text' &&
+        fallbackAttempts.length === 2 &&
+        fallbackAttempts[0]?.source === 'saved_html' &&
+        fallbackAttempts[0]?.highlighted === false &&
+        fallbackAttempts[1]?.source === 'saved_text' &&
+        fallbackAttempts[1]?.highlighted === true,
+      fallbackAttempts.map((a) => `${a.source}:${a.highlighted ? '光った' : '光らず'}`).join(' → '),
+    )
+    check(
+      '2 つの試行の画像が別のパスに残る（上書きしない）',
+      fallbackAttempts[0]?.path !== null &&
+        fallbackAttempts[1]?.path !== null &&
+        fallbackAttempts[0]?.path !== fallbackAttempts[1]?.path,
+      `${String(fallbackAttempts[0]?.path)} / ${String(fallbackAttempts[1]?.path)}`,
+    )
+    for (const attempt of fallbackAttempts) {
+      if (attempt.path === null) continue
+      const bytes = await stat(path.join(WORK_DIR, sessionId, attempt.path))
+      check(
+        `試行 ${attempt.source} の画像が実体として保存されている`,
+        bytes.size > 1000,
+        `${attempt.path} = ${bytes.size} バイト`,
+      )
+    }
+    check(
+      '保存 HTML で撮れなかった理由が全文残る',
+      typeof fallbackAttach.data.screenshot_note === 'string' &&
+        String(fallbackAttach.data.screenshot_note).includes('saved_html') &&
+        String(fallbackAttach.data.screenshot_note).includes('描画矩形が取れず'),
+      String(fallbackAttach.data.screenshot_note).replace(/\n/g, ' / '),
+    )
 
     log('\n[7] set_verdict')
     const badVerdict = await callTool(client, 'set_verdict', {
@@ -757,12 +1351,301 @@ async function main(): Promise<void> {
       'contradicted が本文にある',
     )
 
+    let exclusionCount = 0
+    let nonClaimCount = 0
+
+    log('\n[10b] 誤登録の取り消しと復元（登録 → 誤添付 → 取消 → 再添付 → 判定 → finalize）')
+    // 誤って付けた添付。関係も理由も間違っている、という想定。
+    const wrongAttach = await callTool(client, 'attach_evidence', {
+      session_id: sessionId,
+      claim_id: claimA.data.claim_id,
+      evidence_id: evidenceId,
+      quote: '営業利益は前年比 95% にとどまり、前年を下回りました。',
+      relation: 'supports',
+      rationale: '（誤登録）別の主張の根拠を取り違えて付けた',
+    })
+    check('誤った添付も登録自体は通る（引用は実在するため）', wrongAttach.ok, wrongAttach.text.slice(0, 120))
+    const wrongAttachmentId = String(wrongAttach.data.attachment_id)
+
+    const excludeWrong = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'exclude',
+      target_type: 'attachment',
+      target_id: wrongAttachmentId,
+      reason: '別の主張の根拠を取り違えて付けた',
+    })
+    check('誤った添付を取り消せる', excludeWrong.ok, excludeWrong.ok ? '' : excludeWrong.text)
+    check(
+      '取り消しても元の添付レコードは台帳に残る',
+      (
+        JSON.parse(await readFile(path.join(report.dir, 'ledger.json'), 'utf8')) as {
+          attachments: Array<{ id: string }>
+        }
+      ).attachments.some((a) => a.id === wrongAttachmentId),
+      `${wrongAttachmentId} は台帳に残っている`,
+    )
+
+    // 根拠消失: claimA の supports は複数あるので、その共通の親である証拠ごと取り消す。
+    // 親（証拠）を取り消すと、ぶら下がる添付が一斉に根拠でなくなることの確認も兼ねる。
+    const excludeBasis = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'exclude',
+      target_type: 'evidence',
+      target_id: evidenceId,
+      reason: '根拠が無くなる状況を作る（検証用）',
+    })
+    check('根拠になっていた証拠を取り消せる', excludeBasis.ok, excludeBasis.ok ? '' : excludeBasis.text)
+    check(
+      '根拠が無くなった判定がその場で報告される',
+      (excludeBasis.data.verdicts_without_basis as Array<{ claim_id: string }>).some(
+        (item) => item.claim_id === claimA.data.claim_id,
+      ),
+      JSON.stringify(excludeBasis.data.verdicts_without_basis),
+    )
+    const blockedFinalize = await callTool(client, 'finalize', { session_id: sessionId })
+    check(
+      '根拠が無くなった判定のままでは finalize が拒否される',
+      !blockedFinalize.ok && blockedFinalize.text.includes('根拠が無くなっている'),
+      blockedFinalize.text.split('\n').slice(0, 3).join(' / '),
+    )
+
+    // 除外取消（復元）で根拠が戻る。
+    const restoreBasis = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'restore',
+      target_type: 'evidence',
+      target_id: evidenceId,
+      reason: 'これは正しい根拠だった',
+    })
+    check('取り消しを戻せる', restoreBasis.ok, restoreBasis.ok ? '' : restoreBasis.text)
+    check(
+      '戻した直後に根拠が揃う',
+      (restoreBasis.data.verdicts_without_basis as unknown[]).length === 0,
+      JSON.stringify(restoreBasis.data.verdicts_without_basis),
+    )
+
+    // 親子の復元: 親（主張）を取り消して戻しても、個別に取り消した子（添付）は戻らない。
+    const excludeParent = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'exclude',
+      target_type: 'claim',
+      target_id: String(claimA.data.claim_id),
+      reason: '主張の切り方を見直す（検証用）',
+    })
+    check('親の主張を取り消せる', excludeParent.ok, excludeParent.ok ? '' : excludeParent.text)
+    const whileParentExcluded = await callTool(client, 'get_status', { session_id: sessionId })
+    check(
+      '親を取り消すと網羅率が下がり、その主張の添付も根拠から外れる',
+      !(whileParentExcluded.data.summary as { coverage: { complete: boolean } }).coverage.complete,
+      `網羅率 complete=${String((whileParentExcluded.data.summary as { coverage: { complete: boolean } }).coverage.complete)}`,
+    )
+    const restoreParent = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'restore',
+      target_type: 'claim',
+      target_id: String(claimA.data.claim_id),
+      reason: 'やはりこの切り方でよい',
+    })
+    check('親の主張を戻せる', restoreParent.ok, restoreParent.ok ? '' : restoreParent.text)
+    const afterParentRestore = JSON.parse(await readFile(path.join(report.dir, 'ledger.json'), 'utf8')) as {
+      exclusions: Array<{ target_id: string; restored: unknown }>
+    }
+    check(
+      '親を戻しても、自分で取り消した子は取り消されたまま',
+      afterParentRestore.exclusions.some((e) => e.target_id === wrongAttachmentId && e.restored === null),
+      afterParentRestore.exclusions
+        .map((e) => `${e.target_id}:${e.restored === null ? '取り消し中' : '復元済み'}`)
+        .join(', '),
+    )
+
+    // 二重取消・二重復元は黙って成功させず、今の状態を示して拒否する。
+    const doubleExclude = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'exclude',
+      target_type: 'attachment',
+      target_id: wrongAttachmentId,
+      reason: '二重取消',
+    })
+    check(
+      '二重取消は「すでに取り消されている」と言って拒否する',
+      !doubleExclude.ok && doubleExclude.text.includes('すでに取り消されている'),
+      doubleExclude.text.split('\n')[0] ?? '',
+    )
+    const doubleRestore = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'restore',
+      target_type: 'claim',
+      target_id: String(claimA.data.claim_id),
+      reason: '二重復元',
+    })
+    check(
+      '二重復元は「戻すものが無い」と言って拒否する',
+      !doubleRestore.ok && doubleRestore.text.includes('戻すものが無い'),
+      doubleRestore.text.split('\n')[0] ?? '',
+    )
+
+    // 再添付して判定を付け直し、finalize まで通す。
+    const reattach = await callTool(client, 'attach_evidence', {
+      session_id: sessionId,
+      claim_id: claimA.data.claim_id,
+      evidence_id: evidenceId,
+      quote: '内訳としては、既存顧客向けの継続利用が全体の 7 割を占めています。',
+      relation: 'supports',
+      rationale: '取り消したあとに付け直した根拠',
+    })
+    check('取り消しのあとに付け直せる', reattach.ok, reattach.ok ? '' : reattach.text)
+    const reverdict = await callTool(client, 'set_verdict', {
+      session_id: sessionId,
+      claim_id: claimA.data.claim_id,
+      verdict: 'verified',
+      rationale: '付け直した根拠で改めて確認した',
+    })
+    check('判定を付け直せる', reverdict.ok, reverdict.ok ? '' : reverdict.text)
+
+    // 古いレポートが「最新」に見えないこと。
+    const staleMarkdown = await readFile(report.markdown, 'utf8')
+    check(
+      '台帳が変わったあとのレポートに、暫定表示であることが書かれている',
+      staleMarkdown.includes('finalize を通していない暫定表示'),
+      staleMarkdown.split('\n').slice(0, 4).join(' / '),
+    )
+
+    const refinalized = await callTool(client, 'finalize', { session_id: sessionId })
+    check('取り消しを整理したあとに finalize が通る', refinalized.ok, refinalized.ok ? '' : refinalized.text)
+    const finalMarkdown = await readFile(report.markdown, 'utf8')
+    check(
+      'finalize すると暫定表示の断りが消える',
+      !finalMarkdown.includes('finalize を通していない暫定表示'),
+      finalMarkdown.split('\n')[2] ?? '',
+    )
+    check(
+      'report.md に取り消し履歴が全件出る（理由つき）',
+      finalMarkdown.includes('## 取り消し履歴') &&
+        finalMarkdown.includes('別の主張の根拠を取り違えて付けた') &&
+        finalMarkdown.includes('やはりこの切り方でよい'),
+      '取り消しと復元の理由が両方載っている',
+    )
+    const verdictSection = finalMarkdown.slice(0, finalMarkdown.indexOf('## 取り消し履歴'))
+    const historySection = finalMarkdown.slice(finalMarkdown.indexOf('## 取り消し履歴'))
+    check(
+      '取り消した添付は判定の節から外れ、履歴の節にだけ残る',
+      !verdictSection.includes('（誤登録）別の主張の根拠を取り違えて付けた') &&
+        historySection.includes('（誤登録）別の主張の根拠を取り違えて付けた'),
+      `判定の節に出る=${verdictSection.includes('（誤登録）')} / 履歴の節に出る=${historySection.includes('（誤登録）')}`,
+    )
+
+    // get_status / finalize / report.json / report.html の集計が一致すること。
+    const finalStatus = await callTool(client, 'get_status', { session_id: sessionId })
+    const finalJson = JSON.parse(await readFile(report.json, 'utf8')) as {
+      summary: { claims: { total: number }; attachments: { total: number }; exclusions: { active: number } }
+      ledger: { exclusions: unknown[] }
+    }
+    const finalHtmlPayload = readEmbeddedJson(
+      await readFile(report.html, 'utf8'),
+      'fact-check-data',
+    ) as ViewerPayload
+    const statusSummary = finalStatus.data.summary as {
+      claims: { total: number }
+      attachments: { total: number }
+      exclusions: { active: number; total: number }
+    }
+    check(
+      'get_status / finalize / report.json / report.html の集計が一致する',
+      statusSummary.claims.total === finalJson.summary.claims.total &&
+        statusSummary.claims.total === finalHtmlPayload.summary.claims.total &&
+        statusSummary.attachments.total === finalJson.summary.attachments.total &&
+        statusSummary.attachments.total === finalHtmlPayload.summary.attachments.total &&
+        statusSummary.exclusions.active === finalJson.summary.exclusions.active &&
+        statusSummary.exclusions.active === finalHtmlPayload.summary.exclusions.active,
+      `主張 ${statusSummary.claims.total} / 添付 ${statusSummary.attachments.total} / 取り消し中 ${statusSummary.exclusions.active}`,
+    )
+    exclusionCount = (finalStatus.data.exclusions as unknown[]).length
+    nonClaimCount = (finalStatus.data.summary as { non_claims: number }).non_claims
+
+    log('\n[10c] セッションの保管と復元')
+    const archived = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'exclude',
+      target_type: 'session',
+      target_id: sessionId,
+      reason: '検証用に一度保管する',
+    })
+    check('セッションを保管できる', archived.ok, archived.ok ? '' : archived.text)
+    const blockedRegister = await callTool(client, 'register_claim', {
+      session_id: sessionId,
+      start: 0,
+      end: 5,
+      claim: '保管中の追加',
+    })
+    check(
+      '保管中は台帳を変える操作を受け付けない',
+      !blockedRegister.ok && blockedRegister.text.includes('保管されている'),
+      blockedRegister.text.split('\n')[0] ?? '',
+    )
+    const readWhileArchived = await callTool(client, 'get_status', { session_id: sessionId })
+    check(
+      '保管中でも読み返しはできる',
+      readWhileArchived.ok && readWhileArchived.data.archived === true,
+      `archived=${String(readWhileArchived.data.archived)}`,
+    )
+    const unarchived = await callTool(client, 'revise_record', {
+      session_id: sessionId,
+      action: 'restore',
+      target_type: 'session',
+      target_id: sessionId,
+      reason: '続きをやる',
+    })
+    check('保管を解除できる', unarchived.ok, unarchived.ok ? '' : unarchived.text)
+    const refinalized2 = await callTool(client, 'finalize', { session_id: sessionId })
+    check('解除後に finalize し直せる', refinalized2.ok, refinalized2.ok ? '' : refinalized2.text)
+    exclusionCount = (
+      (await callTool(client, 'get_status', { session_id: sessionId })).data.exclusions as unknown[]
+    ).length
+
+    log('\n[10d] 取り消し履歴を持たない旧台帳を読む')
+    const legacyDir = path.join(WORK_DIR, 'legacy_session')
+    await mkdir(legacyDir, { recursive: true })
+    const currentLedger = JSON.parse(await readFile(path.join(report.dir, 'ledger.json'), 'utf8')) as Record<
+      string,
+      unknown
+    > & { session_id: string; attachments: Array<Record<string, unknown>> }
+    // 取り消し機能より前の version 2 の台帳を再現する: 新しく足した項目を落とす。
+    currentLedger.session_id = 'legacy_session'
+    delete currentLedger.exclusions
+    delete currentLedger.reports_stale_since
+    for (const attachment of currentLedger.attachments) delete attachment.screenshot_attempts
+    await writeFile(path.join(legacyDir, 'ledger.json'), `${JSON.stringify(currentLedger, null, 2)}\n`)
+    await writeFile(
+      path.join(legacyDir, 'source.txt'),
+      await readFile(path.join(report.dir, 'source.txt'), 'utf8'),
+    )
+    const legacyStatus = await callTool(client, 'get_status', { session_id: 'legacy_session' })
+    check(
+      '取り消し履歴を持たない旧台帳も読める',
+      legacyStatus.ok && (legacyStatus.data.exclusions as unknown[]).length === 0,
+      legacyStatus.ok ? '取り消し 0 件として読めた' : (legacyStatus.text.split('\n')[0] ?? ''),
+    )
+    const legacyEdit = await callTool(client, 'revise_record', {
+      session_id: 'legacy_session',
+      action: 'exclude',
+      target_type: 'claim',
+      target_id: String(claimA.data.claim_id),
+      reason: '旧台帳でも取り消せること',
+    })
+    check(
+      '旧台帳でも取り消しを追記できる',
+      legacyEdit.ok,
+      legacyEdit.ok ? '' : (legacyEdit.text.split('\n')[0] ?? ''),
+    )
+
     log('\n[11] report.html をブラウザで開いて操作する')
     await checkViewerPage(report.html, {
       partiallyVerifiedClaim: String(claimD.data.claim_id),
       verifiedClaim: String(claimA.data.claim_id),
       screenshotPath: String(highlightShot),
       claimCount: 4,
+      nonClaimCount,
+      exclusionCount,
     })
 
     log('\n[12] pnpm viewer でセッション一覧を配る')

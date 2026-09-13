@@ -1,12 +1,14 @@
 import { execFile } from 'node:child_process'
-import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { fileExists } from '../src/session/ledger-store.js'
 import { buildSamplePdf } from './fixtures/build-sample-pdf.js'
+import { callTool } from './mcp/call-tool.js'
 
 /**
  * 「npm から入れたときに動くか」だけを見る end-to-end 検証。
@@ -35,8 +37,10 @@ const EXPECTED_TOOLS = [
   'finalize',
   'get_status',
   'mark_non_claim',
+  'read_source_segments',
   'register_claim',
   'register_segments',
+  'revise_record',
   'set_verdict',
   'start_session',
   'submit_agent_capture',
@@ -66,24 +70,27 @@ function check(label: string, condition: boolean, detail: string): void {
   log(`  [NG] ${label} — ${detail}`)
 }
 
-type ToolOutcome = { ok: boolean; text: string; data: Record<string, unknown> }
-
-async function callTool(client: Client, name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
-  const result = await client.callTool({ name, arguments: args })
-  const content = result.content as Array<{ type: string; text: string }>
-  const text = content.map((part) => part.text).join('\n')
-  const ok = result.isError !== true
-  return { ok, text, data: ok ? (JSON.parse(text) as Record<string, unknown>) : {} }
-}
-
+/**
+ * 外部コマンドを走らせて stdout を返す。
+ *
+ * **stderr は成功しても捨てない。** npm は成功しても警告（非推奨の依存・peer の食い違い・
+ * ネットワークの再試行）を stderr に出す。捨てると「この Node で通った」の中身が消え、
+ * 下限の Node で何が起きていたのかを後から追えなくなる。
+ * 失敗したときは cause をそのまま残したうえで、stdout と stderr の**両方**を添える。
+ * 片方だけだと、npm のようにエラー本文を stdout 側へ出す道具の理由が消える。
+ */
 async function run(command: string, args: string[], cwd: string): Promise<string> {
+  const label = `${command} ${args.join(' ')}`
   try {
-    const { stdout } = await execFileAsync(command, args, { cwd, maxBuffer: 64 * 1024 * 1024 })
+    const { stdout, stderr } = await execFileAsync(command, args, { cwd, maxBuffer: 64 * 1024 * 1024 })
+    if (stderr !== '') log(`  [警告] ${label} は成功したが stderr に出力があった:\n${stderr}`)
     return stdout
   } catch (cause) {
-    const stderr = (cause as { stderr?: string }).stderr ?? ''
+    const { stdout, stderr } = cause as { stdout?: string; stderr?: string }
     throw new Error(
-      `${command} ${args.join(' ')} が失敗した (cwd=${cwd})${stderr === '' ? '' : `\n${stderr}`}`,
+      `${label} が失敗した (cwd=${cwd})\n` +
+        `--- stdout ---\n${stdout ?? '（取得できなかった）'}\n` +
+        `--- stderr ---\n${stderr ?? '（取得できなかった）'}`,
       { cause },
     )
   }
@@ -107,13 +114,13 @@ async function installFromTarball(): Promise<string> {
   return path.join(INSTALL_DIR, 'node_modules', '.bin', 'fact-check-mcp')
 }
 
-async function exists(target: string): Promise<boolean> {
-  try {
-    await stat(target)
-    return true
-  } catch {
-    return false
-  }
+/** npm pack が詰めた package.json の version。tarball はこの直前に ROOT から作っている。 */
+async function packageVersion(): Promise<string> {
+  const raw = await readFile(path.join(ROOT, 'package.json'), 'utf8')
+  const version = (JSON.parse(raw) as { version?: unknown }).version
+  if (typeof version !== 'string')
+    throw new Error(`package.json の version が文字列でない: ${JSON.stringify(version)}`)
+  return version
 }
 
 async function startFixtureServer(): Promise<{ origin: string; close: () => Promise<void> }> {
@@ -155,10 +162,10 @@ async function main(): Promise<void> {
 
   log('[1] npm pack した tarball を空のディレクトリへ入れる')
   const bin = await installFromTarball()
-  check('インストール先に bin がある', await exists(bin), path.relative(ROOT, bin))
+  check('インストール先に bin がある', await fileExists(bin), path.relative(ROOT, bin))
   check(
     '実行時に tsx（devDependency）を要求しない',
-    !(await exists(path.join(INSTALL_DIR, 'node_modules', 'tsx'))),
+    !(await fileExists(path.join(INSTALL_DIR, 'node_modules', 'tsx'))),
     'node_modules に tsx が無い',
   )
 
@@ -167,6 +174,16 @@ async function main(): Promise<void> {
   try {
     const names = (await client.listTools()).tools.map((tool) => tool.name).sort()
     check('ツール一覧', names.join(',') === EXPECTED_TOOLS.join(','), names.join(', '))
+
+    // 名乗る版が package.json とずれると、利用者は「どの版が動いているか」を確かめられない。
+    // ここは配布物での確認なので、dist から見た package.json の解決が正しいことまで見ている。
+    const packedVersion = await packageVersion()
+    const announced = client.getServerVersion()?.version
+    check(
+      '起動時に名乗る版が梱包した package.json と一致する',
+      announced === packedVersion,
+      `serverInfo.version=${String(announced)} / package.json=${packedVersion}`,
+    )
 
     log('\n[3] PDF の本文抽出が npm の node_modules でも動く（pdfjs の同梱データのパス解決）')
     const pdfPath = path.join(WORK_DIR, 'filing.pdf')

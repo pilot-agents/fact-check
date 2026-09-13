@@ -5,8 +5,9 @@ import { z } from 'zod'
 import { FactCheckError } from '../errors.js'
 import { sha256 } from '../evidence/fetch-source.js'
 import { collapseWhitespace } from '../evidence/html-to-text.js'
+import { findQuote } from '../quote-matching/find-quote.js'
 import { EVIDENCE_DIR, nextId, sessionDir, updateLedger, writeSessionFile } from '../session/ledger-store.js'
-import type { Evidence } from '../session/ledger-types.js'
+import type { Evidence, TermCheck } from '../session/ledger-types.js'
 import {
   discoveredViaInput,
   discoveryNoteInput,
@@ -22,6 +23,9 @@ const DESCRIPTION = [
   '（どちらか一方だけ。両方指定・両方未指定は拒否する）。',
   'この経路で登録した証拠は provenance=agent_captured として記録され、レポートには「ツールが直接',
   '取得していない証拠」という警告が必ず付く。取得できる URL でこの経路を使ってはいけない。',
+  'expected_terms に「そのページで確かめたい語」を並べると、引用照合と同じ規則で実在を照合し、',
+  '見つからなかった語を警告として応答と台帳に残す（本文の抽出に失敗した内容を出したことに気づける）。',
+  '警告が出ても登録はできる。未指定なら「未検査」と記録される（本文は書き換えない）。',
   '次に呼ぶもの: 返ってきた evidence_id を attach_evidence に渡すこと（引用文の実在照合は同じように行われる）。',
 ].join('\n')
 
@@ -50,15 +54,34 @@ export function registerSubmitAgentCapture(server: McpServer): void {
           .string()
           .optional()
           .describe('あなたが保存したスクリーンショットのローカルパス。セッションディレクトリに複製される'),
+        expected_terms: z
+          .array(z.string().min(1))
+          .min(1)
+          .optional()
+          .describe(
+            'そのページに在るはずの語（見出し・数値・固有名など）。提出した本文に実在するかを照合し、' +
+              '見つからない語は警告として残す。未指定なら「未検査」と記録される',
+          ),
         note: z.string().min(1).describe('どのツールでどう取得したか、fetch_evidence がなぜ使えなかったか'),
       },
     },
-    async ({ session_id, url, text, text_path, discovered_via, discovery_note, screenshot_path, note }) => {
+    async ({
+      session_id,
+      url,
+      text,
+      text_path,
+      discovered_via,
+      discovery_note,
+      screenshot_path,
+      expected_terms,
+      note,
+    }) => {
       const submitted = await loadSubmittedText(text, text_path, url)
       const normalized = collapseWhitespace(submitted.text)
       if (normalized.length === 0) {
         throw new FactCheckError(`提出された本文テキストが空だった (url=${url}, 入力=${submitted.from})`)
       }
+      const termCheck = checkExpectedTerms(normalized, expected_terms)
       const record = await updateLedger(session_id, async (ledger) => {
         const evidenceId = nextId('evidence', ledger.evidence)
         const textPath = await writeSessionFile(
@@ -91,6 +114,7 @@ export function registerSubmitAgentCapture(server: McpServer): void {
             },
           ],
           note,
+          term_check: termCheck,
         }
         ledger.evidence.push(created)
         return created
@@ -102,6 +126,7 @@ export function registerSubmitAgentCapture(server: McpServer): void {
         discovery_note: record.discovery_note,
         warning:
           'この証拠はツールが直接取得していない。取得元の実在も内容の同一性もツールでは検証されていない旨がレポートに明記される。',
+        expected_terms: termCheckResult(termCheck),
         text_sha256: record.text_sha256,
         saved: { text_path: record.text_path, screenshot_path: record.screenshot_path },
         ...textWindow(
@@ -113,6 +138,45 @@ export function registerSubmitAgentCapture(server: McpServer): void {
       })
     },
   )
+}
+
+/**
+ * 申告された語が提出本文に実在するかを、引用照合と同じ規則で見る。
+ *
+ * 意味は判定しない（CSS の密度のような未検証の目安で拒否すると、体裁の崩れた本物まで締め出す）。
+ * 判定するのは「申告した語が在るか」だけで、結果は拒否ではなく警告として残す。
+ * 未申告は空の結果ではなく null で残す — 「検査していない」と「検査して問題なし」は別の事実。
+ */
+function checkExpectedTerms(text: string, terms: readonly string[] | undefined): TermCheck | null {
+  if (terms === undefined) return null
+  return {
+    terms: [...terms],
+    missing: terms.filter((term) => !findQuote(text, term).found),
+    declared_by: 'agent',
+  }
+}
+
+/** 応答に載せる照合結果。未検査であることを空欄で済ませず言葉にする。 */
+function termCheckResult(check: TermCheck | null): Record<string, unknown> {
+  if (check === null) {
+    return {
+      checked: false,
+      note: 'expected_terms が未指定のため、提出本文が目的のページの内容かどうかは検査していない。',
+    }
+  }
+  if (check.missing.length === 0) {
+    return { checked: true, terms: check.terms, missing: [], note: null }
+  }
+  return {
+    checked: true,
+    terms: check.terms,
+    missing: check.missing,
+    note:
+      `申告した ${check.terms.length} 語のうち ${check.missing.length} 語が提出本文に見つからなかった: ` +
+      `${check.missing.map((term) => `「${term}」`).join(' / ')}。` +
+      '本文の抽出に失敗している（CSS や別ページを拾った）可能性がある。登録はしたが、' +
+      '引用を添付する前に本文を読み直すこと。この警告は台帳とレポートに残る。',
+  }
 }
 
 /**

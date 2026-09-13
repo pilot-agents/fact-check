@@ -28,6 +28,17 @@
       <p>to LEO までを想定しています。</p>
       <h2>海外向けの出荷</h2>
       <p>The overseas shipment totalled 412 units in the quarter.</p>
+      <h2>補足</h2>
+      <!--
+        ページ自身が隠している一節。本文の抽出には出るのに、保存 HTML を描いても
+        描画矩形が取れない。実データで 35 件中 3 件がこの形だった。
+        画像の代替経路（保存した抽出本文を描く）を e2e で踏むための固定ページ。
+        **ツール側でこの display:none を解除することはしない。** 解除せずに、
+        取得時に保存した抽出本文のほうを描いて引用箇所を示す。
+      -->
+      <div style="display: none">
+        <p>The deferred note records 87 exceptions handled during the quarter.</p>
+      </div>
       <h2>今後の見通し</h2>
       <p>
         次期は売上の伸長を維持しつつ、費用構造の見直しを進める方針です。数値目標は次回の開示時にあらためて示します。

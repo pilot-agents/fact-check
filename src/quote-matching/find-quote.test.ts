@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'vitest'
-import { findQuote, locateQuoteIgnoringWhitespace } from './find-quote.js'
-import { normalizeForMatch } from './normalize.js'
+import { describe, expect, test, vi } from 'vitest'
+import { findQuote, findQuoteAll, locateQuoteIgnoringWhitespace } from './find-quote.js'
+import * as normalizeModule from './normalize.js'
+import { normalizeForMatch, normalizeWithIndex } from './normalize.js'
 
 describe('normalizeForMatch', () => {
   test.each([
@@ -148,5 +149,88 @@ describe('locateQuoteIgnoringWhitespace', () => {
     const haystack = '売上\nは増えた。'
     expect(locateQuoteIgnoringWhitespace(haystack, '売上は増えた。')).not.toBeNull()
     expect(findQuote(haystack, '売上は増えた。').found).toBe(false)
+  })
+})
+
+/**
+ * fetch_evidence の find が「何件あるか」を出せないと、呼ぶ側は先頭 1 件を見て
+ * 「この記述はここにしかない」と誤解する。件数と位置が findQuote と同じ規則で出ることを固定する。
+ */
+describe('findQuoteAll: 一致箇所を全部返す', () => {
+  const REPEATED = '売上は増えた。利益も増えた。来期も増えた。'
+
+  test.each([
+    { name: '一致なし', haystack: REPEATED, quote: '減った', expected: [] },
+    { name: '一致 1 件', haystack: REPEATED, quote: '売上', expected: ['売上'] },
+    { name: '一致 3 件', haystack: REPEATED, quote: '増えた', expected: ['増えた', '増えた', '増えた'] },
+    { name: '空の検索語', haystack: REPEATED, quote: '', expected: [] },
+    { name: '空白だけの検索語', haystack: REPEATED, quote: ' 　\n', expected: [] },
+    { name: '空の本文', haystack: '', quote: '増えた', expected: [] },
+    {
+      name: '正規化: 全角で書いても半角の本文に当たる',
+      haystack: 'A 120% と 120% ',
+      quote: '１２０％',
+      expected: ['120%', '120%'],
+    },
+    {
+      name: '空白差: 本文側の連続空白を畳んで当たる',
+      haystack: '売上は  前年比 と 売上は 前年比',
+      quote: '売上は 前年比',
+      expected: ['売上は  前年比', '売上は 前年比'],
+    },
+    { name: '重なりは数えない', haystack: 'aaaa', quote: 'aa', expected: ['aa', 'aa'] },
+  ])('$name', ({ haystack, quote, expected }) => {
+    const ranges = findQuoteAll(haystack, quote)
+    expect(ranges.map((range) => haystack.slice(range.start, range.end))).toEqual(expected)
+  })
+
+  /**
+   * 写像の破損（normalizeWithIndex の starts/ends が normalized と揃わない）は内部バグであって
+   * 「本文に無かった」ではない。読み飛ばすと、原因不明のまま「引用が見つからない」と報告される。
+   *
+   * 破損は正常な入力からは作れないので、oracle は「正規化の写像が常に揃っている」ことの全数確認と、
+   * 人工的に壊した 1 件で詳細付きの例外が出ることの 2 本立てにする。
+   */
+  test.each([
+    { name: 'ASCII', text: 'sales grew 120%' },
+    { name: '和文', text: '売上は前年比 120% に達した。' },
+    { name: '全角英数', text: 'ＡＢＣ１２３' },
+    { name: '半角カタカナ', text: 'ｶﾀｶﾅを含む' },
+    { name: 'サロゲートペア', text: '🇯🇵の売上🇯🇵' },
+    { name: 'ZWJ 絵文字', text: '👨‍👩‍👧‍👦 は 3 件' },
+    { name: '結合文字', text: 'é と é' },
+    { name: '空白だけ', text: ' 　\n\t ' },
+    { name: '空文字列', text: '' },
+  ])('$name: 正規化の写像は normalized と常に同じ長さ', ({ text }) => {
+    const normalized = normalizeWithIndex(text)
+    expect(normalized.starts).toHaveLength(normalized.normalized.length)
+    expect(normalized.ends).toHaveLength(normalized.normalized.length)
+    const dropped = normalizeWithIndex(text, 'drop')
+    expect(dropped.starts).toHaveLength(dropped.normalized.length)
+    expect(dropped.ends).toHaveLength(dropped.normalized.length)
+  })
+
+  test('写像が壊れていたら読み飛ばさず、位置を添えて投げる', () => {
+    // 正常な入力からは作れない状態なので、写像だけを人工的に削って注入する。
+    const haystack = '売上は前年比 120% に達した。'
+    const broken = normalizeWithIndex(haystack)
+    broken.ends.length = 1
+    const spy = vi.spyOn(normalizeModule, 'normalizeWithIndex').mockReturnValueOnce(broken)
+    try {
+      expect(() => findQuoteAll(haystack, '前年比')).toThrow(/正規化位置の写像が壊れている/)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test('返る位置は昇順で、findQuote の 1 件目と一致する', () => {
+    const ranges = findQuoteAll(REPEATED, '増えた')
+    expect(ranges.map((range) => range.start)).toEqual(
+      [...ranges.map((range) => range.start)].sort((a, b) => a - b),
+    )
+    const first = findQuote(REPEATED, '増えた')
+    expect(first.found).toBe(true)
+    if (!first.found) return
+    expect(ranges[0]).toEqual({ start: first.start, end: first.end })
   })
 })

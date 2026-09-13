@@ -14,15 +14,27 @@ import {
   readSessionFile,
   updateLedger,
 } from '../session/ledger-store.js'
-import type { Attachment, Evidence, Ledger, PdfSnapshot } from '../session/ledger-types.js'
-import { findClaim, findEvidence, jsonResult, sessionIdInput } from './tool-context.js'
+import type {
+  Attachment,
+  Evidence,
+  Ledger,
+  PdfSnapshot,
+  ScreenshotAttempt,
+  ScreenshotSource,
+} from '../session/ledger-types.js'
+import { assertSessionOpen, findClaim, findEvidence, jsonResult, sessionIdInput } from './tool-context.js'
 
 const DESCRIPTION = [
   'claim と evidence を引用文で結びつける。このツールは引用文を鵜呑みにしない:',
   '引用文が証拠の本文テキストに実在するかを、空白の連続を 1 つに畳み Unicode NFKC 正規化した上での',
   '完全部分一致で照合し、見つからなければ登録を拒否する（最も近い箇所の抜粋を添えて返す）。',
   '証拠の URL が元ネタの URL と同じ場合も自己参照として拒否する。',
-  'URL 証拠は照合に通った時点でブラウザを開き、該当箇所までスクロールしてハイライトしたスクショを保存する。',
+  'URL 証拠は照合に通った時点で、**取得時に保存したスナップショット**（HTML、無ければ抽出本文）を',
+  'ブラウザで描き、該当箇所をハイライトしたスクショを保存する。ライブページは開き直さないので、',
+  '取得後にページが落ちても 403 になっても画像は残る。代わりに外部 CSS と画像は当たらないため、',
+  '画像は「取得時点の保存内容を描いたもの」であって元ページの外観の再現ではない（screenshot_source に残る）。',
+  '保存 HTML で引用箇所を描けなかった場合は、取得時に保存した抽出本文を描いて撮り直す。',
+  'その画像には「抽出本文を描画したもの」と焼き込む。HTML 側の失敗理由と画像は別パスに全部残る。',
   'PDF 証拠は引用箇所のあるページを描画し、その箇所に枠を重ねたスクショを保存する（ページ番号も記録する）。',
   '次に呼ぶもの: その claim を支える／否定する証拠を出し切ったら set_verdict。',
 ].join('\n')
@@ -49,6 +61,7 @@ export function registerAttachEvidence(server: McpServer): void {
     },
     async ({ session_id, claim_id, evidence_id, quote, relation, rationale }) => {
       const outcome = await updateLedger(session_id, async (ledger) => {
+        assertSessionOpen(ledger)
         const claim = findClaim(ledger, claim_id)
         const evidence = findEvidence(ledger, evidence_id)
         assertNotSelfReference(ledger, evidence)
@@ -69,7 +82,7 @@ export function registerAttachEvidence(server: McpServer): void {
         }
 
         const attachmentId = nextId('attachment', ledger.attachments)
-        const shot = await screenshotFor(session_id, attachmentId, evidence, quote, match)
+        const shot = await screenshotFor(session_id, attachmentId, evidence, evidenceText, quote, match)
         const attachment: Attachment = {
           id: attachmentId,
           claim_id,
@@ -82,6 +95,8 @@ export function registerAttachEvidence(server: McpServer): void {
           pdf_page: shot.pdfPage,
           screenshot_path: shot.screenshotPath,
           screenshot_note: shot.note,
+          screenshot_source: shot.source,
+          screenshot_attempts: shot.attempts,
         }
         ledger.attachments.push(attachment)
 
@@ -104,7 +119,9 @@ export function registerAttachEvidence(server: McpServer): void {
         },
         pdf_page: outcome.attachment.pdf_page,
         screenshot_path: outcome.attachment.screenshot_path,
+        screenshot_source: outcome.attachment.screenshot_source,
         screenshot_note: outcome.attachment.screenshot_note,
+        screenshot_attempts: outcome.attachment.screenshot_attempts,
         claim_attachment_counts: outcome.counts,
         next_step: `この claim (${outcome.claimId}) に出せる証拠を出し切ったら set_verdict を呼ぶこと。`,
       })
@@ -154,12 +171,46 @@ function sameUrl(a: string, b: string): boolean {
   return left.href === right.href
 }
 
-type ScreenshotOutcome = { screenshotPath: string | null; note: string | null; pdfPage: number | null }
+type ScreenshotOutcome = {
+  screenshotPath: string | null
+  note: string | null
+  pdfPage: number | null
+  source: ScreenshotSource | null
+  /** 採用しなかった試行も含めた全部。台帳にそのまま入る */
+  attempts: ScreenshotAttempt[]
+}
 
+/** 試行を持たない結果（PDF・AI 提出・ローカルファイル）を、同じ形に揃えるための包み。 */
+function withoutAttempts(outcome: Omit<ScreenshotOutcome, 'attempts'>): ScreenshotOutcome {
+  return {
+    ...outcome,
+    attempts:
+      outcome.source === null
+        ? []
+        : [
+            {
+              source: outcome.source,
+              path: outcome.screenshotPath,
+              highlighted: outcome.screenshotPath !== null && outcome.note === null,
+              note: outcome.note,
+              adopted: true,
+            },
+          ],
+  }
+}
+
+/**
+ * 添付の画像を作る。
+ *
+ * URL 証拠はライブページを開き直さず、取得時に保存したスナップショット（HTML、無ければ抽出本文）を
+ * 描く。取り直すと取得時と違う内容が写り、外部の停止・403・タイムアウトにも引きずられる。
+ * AI 提出証拠と PDF 証拠は取得経路が違うので、扱いも分けたまま残す。
+ */
 async function screenshotFor(
   sessionId: string,
   attachmentId: string,
   evidence: Evidence,
+  evidenceText: string,
   quote: string,
   match: { start: number; end: number },
 ): Promise<ScreenshotOutcome> {
@@ -167,32 +218,137 @@ async function screenshotFor(
     return await pdfScreenshot(sessionId, attachmentId, evidence, evidence.pdf, match)
   }
   if (evidence.provenance === 'agent_captured') {
-    return evidence.screenshot_path === null
-      ? {
-          screenshotPath: null,
-          note: 'AI が提出した証拠にスクリーンショットが添えられていなかった',
-          pdfPage: null,
-        }
-      : {
-          screenshotPath: evidence.screenshot_path,
-          note: 'AI が提出したスクリーンショットをそのまま使っている（ツールが撮影したものではない）',
-          pdfPage: null,
-        }
+    return withoutAttempts(
+      evidence.screenshot_path === null
+        ? {
+            screenshotPath: null,
+            note: 'AI が提出した証拠にスクリーンショットが添えられていなかった',
+            pdfPage: null,
+            source: null,
+          }
+        : {
+            screenshotPath: evidence.screenshot_path,
+            note: 'AI が提出したスクリーンショットをそのまま使っている（ツールが撮影したものではない）',
+            pdfPage: null,
+            source: 'agent_captured',
+          },
+    )
   }
   if (evidence.source.type === 'file') {
-    return {
+    return withoutAttempts({
       screenshotPath: null,
       note: `証拠がローカルファイルのためスクリーンショットは無い (path=${evidence.source.path})`,
       pdfPage: null,
+      source: null,
+    })
+  }
+  return await urlScreenshot(sessionId, attachmentId, evidence, evidence.source.url, evidenceText, quote)
+}
+
+/**
+ * URL 証拠の画像。**保存 HTML で撮れなければ、保存した抽出本文を描いて撮り直す。**
+ *
+ * 保存 HTML を描いても引用箇所に描画矩形が取れないことがある（実データで 35 件中 3 件。
+ * 元ページで折りたたまれていた・非表示だった要素の中に引用があるとこうなる）。読める本文は
+ * 保存してあるのに画像だけ得られないのは、証拠として不十分だった。
+ *
+ * ただし**撮り直しは 1 回だけ**で、手を変えて何度も試さない。そして
+ * **HTML 側の失敗理由を 1 文字も捨てない**: 別のパスに保存した HTML の画像も、その失敗の
+ * 全文も、screenshot_attempts に残す。「なぜ元ページの見た目で撮れなかったか」は、
+ * 画像が手に入ったかどうかとは別に読み手が知るべきこと。
+ *
+ * 通信遮断と JS 無効は captureQuoteHighlight 側の条件をそのまま使う（どちらの試行も同じ）。
+ * display:none の解除やペイウォールの回避は行わない。抽出本文は取得時に既に保存済みのもので、
+ * 新たに外部へ当たることもない。
+ */
+async function urlScreenshot(
+  sessionId: string,
+  attachmentId: string,
+  evidence: Evidence,
+  origin: string,
+  evidenceText: string,
+  quote: string,
+): Promise<ScreenshotOutcome> {
+  const attempts: ScreenshotAttempt[] = []
+  if (evidence.html_path !== null) {
+    const html = await readSessionFile(sessionId, evidence.html_path)
+    const outcome = await captureQuoteHighlight({
+      sessionId,
+      origin,
+      snapshot: { kind: 'html', html },
+      quote,
+      // 撮り直すときに上書きしないよう、試行ごとにパスを分ける。同じ名前で 2 回書くと
+      // 「HTML では何が写っていたか」が消えて、失敗の検証ができなくなる。
+      screenshotRelativePath: path.posix.join(ATTACHMENT_DIR, `${attachmentId}-saved-html.png`),
+    })
+    attempts.push({
+      source: 'saved_html',
+      path: outcome.screenshotPath,
+      highlighted: outcome.highlighted,
+      note: outcome.note,
+      adopted: outcome.highlighted,
+    })
+    if (outcome.highlighted) {
+      return {
+        screenshotPath: outcome.screenshotPath,
+        note: null,
+        pdfPage: null,
+        source: 'saved_html',
+        attempts,
+      }
     }
   }
-  const outcome = await captureQuoteHighlight({
+
+  const fallback = await captureQuoteHighlight({
     sessionId,
-    url: evidence.source.url,
+    origin,
+    snapshot: { kind: 'text', text: evidenceText },
     quote,
-    screenshotRelativePath: path.posix.join(ATTACHMENT_DIR, `${attachmentId}.png`),
+    screenshotRelativePath: path.posix.join(ATTACHMENT_DIR, `${attachmentId}-saved-text.png`),
   })
-  return { screenshotPath: outcome.screenshotPath, note: outcome.note, pdfPage: null }
+  attempts.push({
+    source: 'saved_text',
+    path: fallback.screenshotPath,
+    highlighted: fallback.highlighted,
+    note: fallback.note,
+    adopted: fallback.screenshotPath !== null,
+  })
+  if (fallback.screenshotPath === null) {
+    // 両方だめだったときは両方の理由を返す。片方だけ返すと、HTML で何が起きたかが消える。
+    return {
+      screenshotPath: null,
+      note: attemptSummary(attempts, origin),
+      pdfPage: null,
+      source: null,
+      attempts,
+    }
+  }
+  return {
+    screenshotPath: fallback.screenshotPath,
+    // 成功しても HTML 側の失敗の全文を残す。ここを null にすると、
+    // 「保存 HTML では撮れなかった」という事実がレポートから消える。
+    note: attemptSummary(attempts, origin),
+    pdfPage: null,
+    source: 'saved_text',
+    attempts,
+  }
+}
+
+/** 試行の並びを、切らずに 1 本の文にする。どの試行がどうなったかを順番に読めるようにする。 */
+function attemptSummary(attempts: readonly ScreenshotAttempt[], origin: string): string {
+  const lines = attempts.map((attempt) => {
+    const state = attempt.highlighted
+      ? 'ハイライト付きで撮れた'
+      : attempt.path === null
+        ? '画像を撮れなかった'
+        : 'ハイライト無しの画像だけ撮れた'
+    return (
+      `- ${attempt.source}: ${state}` +
+      (attempt.path === null ? '' : ` (${attempt.path})`) +
+      (attempt.note === null ? '' : ` — ${attempt.note}`)
+    )
+  })
+  return [`画像を作るために試したこと (origin=${origin}):`, ...lines].join('\n')
 }
 
 /**
@@ -212,11 +368,12 @@ async function pdfScreenshot(
   const origin = evidence.source.type === 'url' ? evidence.source.url : evidence.source.path
   const page = pdf.pages.find((p) => p.start <= match.start && match.start < p.end) ?? null
   if (page === null) {
-    return {
+    return withoutAttempts({
       screenshotPath: null,
       note: `引用箇所 [${match.start}, ${match.end}) がどのページ範囲にも入らなかった (origin=${origin})`,
       pdfPage: null,
-    }
+      source: null,
+    })
   }
   const bytes = await readSessionBytes(sessionId, pdf.path)
   const reextracted = await extractPdfText(bytes, origin)
@@ -233,11 +390,17 @@ async function pdfScreenshot(
     origin,
   })
   if (!consistent && outcome.screenshotPath !== null) {
-    return {
+    return withoutAttempts({
       screenshotPath: outcome.screenshotPath,
       note: `保存済みの PDF から取り直した本文が保存時と一致しなかったため、枠を重ねずに ${page.page} ページ目全体を描画した (origin=${origin})`,
       pdfPage: page.page,
-    }
+      source: 'pdf_page',
+    })
   }
-  return { screenshotPath: outcome.screenshotPath, note: outcome.note, pdfPage: page.page }
+  return withoutAttempts({
+    screenshotPath: outcome.screenshotPath,
+    note: outcome.note,
+    pdfPage: page.page,
+    source: outcome.screenshotPath === null ? null : 'pdf_page',
+  })
 }

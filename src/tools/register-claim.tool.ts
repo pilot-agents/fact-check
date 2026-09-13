@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { loadSourceText, updateLedger } from '../session/ledger-store.js'
 import { assertValidRange } from '../source-text/ranges.js'
 import { addClaim, coverageProgress } from './range-records.js'
-import { jsonResult, sessionIdInput } from './tool-context.js'
+import { assertSessionOpen, jsonResult, sessionIdInput } from './tool-context.js'
 
 const DESCRIPTION = [
   '元ネタの 1 範囲を「裏取りすべき事実主張」として登録する。範囲は start_session が返した',
@@ -29,6 +29,7 @@ export function registerRegisterClaim(server: McpServer): void {
     },
     async ({ session_id, start, end, claim, kind }) => {
       const result = await updateLedger(session_id, async (ledger) => {
+        assertSessionOpen(ledger)
         const sourceText = await loadSourceText(ledger)
         assertValidRange(sourceText.length, start, end, 'register_claim の範囲')
         const record = addClaim(ledger, sourceText, { start, end, claim, kind: kind ?? null })

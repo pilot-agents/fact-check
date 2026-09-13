@@ -4,7 +4,7 @@ import { FactCheckError } from '../errors.js'
 import { loadSourceText, updateLedger } from '../session/ledger-store.js'
 import { rangeProblem } from '../source-text/ranges.js'
 import { addClaim, addNonClaim, coverageProgress } from './range-records.js'
-import { jsonResult, sessionIdInput } from './tool-context.js'
+import { assertSessionOpen, jsonResult, sessionIdInput } from './tool-context.js'
 
 /**
  * 範囲のまとめ登録。
@@ -57,6 +57,7 @@ export function registerRegisterSegments(server: McpServer): void {
     },
     async ({ session_id, items }) => {
       const result = await updateLedger(session_id, async (ledger) => {
+        assertSessionOpen(ledger)
         const sourceText = await loadSourceText(ledger)
         assertAllItemsValid(items, sourceText.length)
         const registered = items.map((item, index) =>

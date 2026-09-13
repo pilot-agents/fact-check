@@ -1,4 +1,4 @@
-import { normalizeWithIndex } from './normalize.js'
+import { type NormalizedText, normalizeWithIndex } from './normalize.js'
 
 /**
  * 引用文が証拠本文に実在するかの照合。
@@ -28,6 +28,32 @@ const ANCHOR_CHARS = 6
 /** これ未満しか一致しない箇所は「近い箇所」として提示しない。 */
 const MIN_NEAREST_CHARS = 4
 
+/**
+ * 正規化後の一致位置を原文の [start, end) に戻す。写し戻しの規則と、その前提の検証は
+ * **この 1 箇所が持つ**（呼ぶ側で重ねて確かめない）。
+ *
+ * 「見つからなかった」は `indexOf` が -1 を返す時点で既に表せている。ここへ来るのは
+ * 一致が在ると分かった後だけなので、写像に穴があるのは normalizeWithIndex の破綻であって
+ * 入力の問題ではない。`null` で返すと呼ぶ側がそれを「不一致」と取り違え、原因不明のまま
+ * 「本文に無かった」と報告されてしまうので、位置を添えて投げる。
+ */
+function toSourceRange(
+  hay: NormalizedText,
+  hit: number,
+  needleLength: number,
+): { start: number; end: number } {
+  const start = hay.starts[hit]
+  const end = hay.ends[hit + needleLength - 1]
+  if (start === undefined || end === undefined) {
+    throw new Error(
+      `内部エラー: 正規化位置の写像が壊れている (hit=${hit}, needleLength=${needleLength}, ` +
+        `mapLength=${hay.starts.length}, normalizedLength=${hay.normalized.length}, ` +
+        `start=${String(start)}, end=${String(end)})`,
+    )
+  }
+  return { start, end }
+}
+
 export function findQuote(haystack: string, quote: string): QuoteMatch {
   const hay = normalizeWithIndex(haystack)
   const needle = normalizeWithIndex(quote).normalized
@@ -37,16 +63,37 @@ export function findQuote(haystack: string, quote: string): QuoteMatch {
 
   const hit = hay.normalized.indexOf(needle)
   if (hit >= 0) {
-    const start = hay.starts[hit]
-    const end = hay.ends[hit + needle.length - 1]
-    if (start === undefined || end === undefined) {
-      throw new Error(
-        `内部エラー: 正規化位置の写像が壊れている (hit=${hit}, needleLength=${needle.length}, mapLength=${hay.starts.length})`,
-      )
+    const range = toSourceRange(hay, hit, needle.length)
+    return {
+      found: true,
+      start: range.start,
+      end: range.end,
+      matchedText: haystack.slice(range.start, range.end),
     }
-    return { found: true, start, end, matchedText: haystack.slice(start, end) }
   }
   return { found: false, nearest: findNearest(haystack, hay, needle) }
+}
+
+/**
+ * 同じ照合規則で、本文中の一致箇所を**全部**返す（重なりは数えない）。
+ *
+ * fetch_evidence の検索語 (find) が使う。「何件あるか」を返さないと、呼ぶ側は先頭の 1 件を見て
+ * 「これが唯一の記述だ」と誤解する。判定に使うのは findQuote のままで、この関数は読む位置を
+ * 決めるためだけに使う。
+ */
+export function findQuoteAll(haystack: string, quote: string): Array<{ start: number; end: number }> {
+  const hay = normalizeWithIndex(haystack)
+  const needle = normalizeWithIndex(quote).normalized
+  if (needle.length === 0) return []
+  const ranges: Array<{ start: number; end: number }> = []
+  for (
+    let hit = hay.normalized.indexOf(needle);
+    hit >= 0;
+    hit = hay.normalized.indexOf(needle, hit + needle.length)
+  ) {
+    ranges.push(toSourceRange(hay, hit, needle.length))
+  }
+  return ranges
 }
 
 /**
@@ -57,6 +104,8 @@ export function findQuote(haystack: string, quote: string): QuoteMatch {
  * PDF のテキストレイヤ）の上で指し直すためだけに使う。空白を全部落として比較するので
  * 「ブロック境界に改行が入る／入らない」「インライン要素の継ぎ目に空白が入る／入らない」の
  * どちらのずれも吸収する。判定に使えば `売上 は` と `売上は` を区別できなくなるため、判定には使わない。
+ *
+ * 返す `null` の意味は「その本文には無かった」の 1 つだけ。写像の破損は toSourceRange が投げる。
  */
 export function locateQuoteIgnoringWhitespace(
   haystack: string,
@@ -67,10 +116,7 @@ export function locateQuoteIgnoringWhitespace(
   if (needle.length === 0) return null
   const hit = hay.normalized.indexOf(needle)
   if (hit < 0) return null
-  const start = hay.starts[hit]
-  const end = hay.ends[hit + needle.length - 1]
-  if (start === undefined || end === undefined) return null
-  return { start, end }
+  return toSourceRange(hay, hit, needle.length)
 }
 
 /**

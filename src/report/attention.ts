@@ -1,4 +1,5 @@
-import type { Ledger, VerdictValue } from '../session/ledger-types.js'
+import { effectiveRecords } from '../session/ledger-effective.js'
+import type { Claim, Exclusion, VerdictValue } from '../session/ledger-types.js'
 
 /**
  * レポートの冒頭に出す「要確認一覧」。
@@ -6,6 +7,9 @@ import type { Ledger, VerdictValue } from '../session/ledger-types.js'
  * claim が 67 件あるレポートでは、読み手が本当に知りたい「どこを直すべきか」が本文の末尾まで
  * 散らばる。verified 以外だけを、重い順（矛盾 → 一部のみ → 裏取り不能）に先頭へ集める。
  * verified は直すところが無いので載せない（載せると一覧が本文の写しになって役に立たない）。
+ *
+ * 取り消された主張は載せない。取り消したものを「要確認」に並べ続けると、直しようのない
+ * 項目が一覧の先頭に居座る。取り消したこと自体は「取り消し履歴」の節で追える。
  */
 
 /** 重い順。この順に並べる。 */
@@ -21,10 +25,14 @@ export type AttentionItem = {
   range: { start: number; end: number }
 }
 
-export function buildAttention(ledger: Pick<Ledger, 'claims'>): AttentionItem[] {
+export function buildAttention(ledger: {
+  claims: readonly Claim[]
+  exclusions?: readonly Exclusion[]
+}): AttentionItem[] {
+  const claims = effectiveRecords(ledger.exclusions, 'claim', ledger.claims)
   const items: AttentionItem[] = []
   for (const verdict of ATTENTION_ORDER) {
-    for (const claim of ledger.claims) {
+    for (const claim of claims) {
       if (claim.verdict === null || claim.verdict.value !== verdict) continue
       items.push({
         claim_id: claim.id,

@@ -115,9 +115,12 @@ function countsHtml(row: SessionRow): string {
  * （report:rebuild で作り直した過去のセッションがここに出る）。
  */
 function reportCell(row: SessionRow): string {
-  const link = row.finalized
-    ? `<a class="report" href="/s/${encodeURIComponent(row.id)}/report.html">report.html</a>`
-    : '<span class="pending">report.html はまだ無い</span>'
+  const link =
+    row.finalized === true
+      ? `<a class="report" href="/s/${encodeURIComponent(row.id)}/report.html">report.html</a>`
+      : row.finalized === false
+        ? '<span class="pending">report.html はまだ無い</span>'
+        : '<span class="pending">report.html の有無を確かめられなかった</span>'
   const summary = row.summary
   // 台帳が読めていないときは進み具合そのものが分からないので、未完了とは書かない。
   if (summary === null) return link

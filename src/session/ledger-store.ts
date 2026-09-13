@@ -1,9 +1,10 @@
 import { randomBytes } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { FactCheckError } from '../errors.js'
+import { normalizeAddedFields } from './ledger-added-fields.js'
 import { withSessionLock } from './ledger-lock.js'
-import { LEDGER_VERSION, type Ledger, type SourceRecord } from './ledger-types.js'
+import { LEDGER_VERSION, type Ledger, READABLE_LEDGER_VERSIONS, type SourceRecord } from './ledger-types.js'
 
 /**
  * セッション台帳の置き場所と読み書き。
@@ -80,6 +81,8 @@ export async function createSession(args: {
     non_claims: [],
     evidence: [],
     attachments: [],
+    exclusions: [],
+    reports_stale_since: null,
   }
   await saveLedger(ledger)
   return { ledger, dir }
@@ -104,12 +107,29 @@ export async function loadLedger(sessionId: string): Promise<Ledger> {
     throw FactCheckError.fromCause(`台帳の JSON が壊れている (path=${filePath})`, cause)
   }
   const ledger = parsed as Ledger
-  if (ledger.version !== LEDGER_VERSION) {
+  // 読めるのは複数の版。書くのは常に今の版（saveLedger）。読んだだけでは版を上げない
+  // ——「読んだら勝手に新しい版になって古いツールで開けなくなる」を避けるため。
+  if (!READABLE_LEDGER_VERSIONS.includes(ledger.version)) {
     throw new FactCheckError(
-      `台帳のバージョンが違う (path=${filePath}, 読めるのは version=${LEDGER_VERSION}, 実際=${String(ledger.version)})`,
+      `台帳のバージョンが違う (path=${filePath}, ` +
+        `読めるのは version=${READABLE_LEDGER_VERSIONS.join(', ')}, ` +
+        `実際=${String(ledger.version)})。` +
+        `このセッションを更新すると version=${LEDGER_VERSION} で保存され、古い版のツールでは開けなくなる。`,
     )
   }
+  // 後から足した項目は、**無いときだけ**既定値を補う。あって形が違うなら拒否する
+  // （空として読むと、取り消したはずの記録が復活した状態に見える）。
+  // 読むだけの経路（report:rebuild / セッション一覧）も同じ関数を通す。
+  normalizeAddedFields(ledger, filePath)
   return ledger
+}
+
+/**
+ * 台帳が変わったので、書き出し済みのレポートはもう最新ではない、と記録する。
+ * 消すのは finalize だけ（レポートを作り直した瞬間だけ「最新」に戻る）。
+ */
+export function markReportsStale(ledger: Ledger): void {
+  ledger.reports_stale_since = new Date().toISOString()
 }
 
 /**
@@ -119,16 +139,140 @@ export async function loadLedger(sessionId: string): Promise<Ledger> {
  * 同じセッションへの同時呼び出しはその間待たされるが、台帳の後勝ち消失より待ち時間を選ぶ。
  * mutate の中から updateLedger を再び呼んではいけない（自分のロックを待つことになる）。
  */
-export async function updateLedger<T>(sessionId: string, mutate: (ledger: Ledger) => Promise<T>): Promise<T> {
+/**
+ * 台帳を変えたあとに、書き出し済みのレポートをどう扱うか。
+ *
+ * - `refresh`（既定）— すでにレポートがあれば書き直す。無ければ何もしない
+ * - `finalize` — 検証を通したので 3 形式を書き出し、**書き出しが成功してから**
+ *   「レポートは最新」の印を台帳に書く
+ */
+export type ReportSyncMode = 'refresh' | 'finalize'
+
+export async function updateLedger<T>(
+  sessionId: string,
+  mutate: (ledger: Ledger) => Promise<T>,
+  reportSync: ReportSyncMode = 'refresh',
+): Promise<T> {
   return await withSessionLock(sessionId, async () => {
     const ledger = await loadLedger(sessionId)
+    // 台帳を変える経路はここしかないので、「書き出し済みのレポートはもう古い」の印も
+    // ここで付ける。ツールごとに書くと、新しいツールを足した人が忘れる。
+    markReportsStale(ledger)
     const result = await mutate(ledger)
+    // **台帳が先、レポートが後。** 逆にすると、レポートの書き出しは成功したのに台帳の保存が
+    // 失敗したとき、レポートが「保存されていない台帳の内容」を最新の結果として見せる。
     await saveLedger(ledger)
+    await syncReports(ledger, reportSync)
     return result
   })
 }
 
+/** 書き出し済みのレポート。無いものは並ばない。 */
+async function presentReports(directory: string): Promise<string[]> {
+  const present: string[] = []
+  for (const name of REPORT_FILE_NAMES) {
+    if (await fileExists(path.join(directory, name))) present.push(name)
+  }
+  return present
+}
+
+const REPORT_FILE_NAMES = ['report.md', 'report.json', 'report.html'] as const
+
+/**
+ * 台帳を保存したあとに、書き出し済みのレポートを合わせる。**必ず台帳の保存より後に呼ぶ。**
+ *
+ * ここに置く理由: 取り消しだけでなく register_claim / attach_evidence / set_verdict などの
+ * ふつうの変更でも、すでにある report.html は古くなる。ツールごとに書くと必ず抜ける。
+ *
+ * **「レポートは最新」の印は、書き出しが成功してから台帳へ書く。**
+ * 以前は finalize が mutate の中で印を消し、その台帳を保存してから書き出していた。
+ * 書き出しが失敗しても印は消えたままなので、`get_status` は「最新」に見えていた。
+ *
+ * この関数の中の失敗は**すべて台帳を保存したあとの失敗**なので、その文脈ごと包んで投げる
+ * （stat・動的 import・元ネタ本文の読み込みも含む。どれも保存後に起きる）。
+ *
+ * 静的 import にしないのは、レポート層がこのファイルの `writeSessionFile` / `sessionDir` を
+ * 使っており、静的に相互参照すると読み込み順に依存する形になるため。
+ */
+async function syncReports(ledger: Ledger, mode: ReportSyncMode): Promise<void> {
+  const directory = sessionDir(ledger.session_id)
+  let present: string[] | null = null
+  try {
+    present = await presentReports(directory)
+    if (mode === 'refresh' && present.length === 0) return
+    const { writeReport } = await import('../report/write-report.js')
+    await writeReport(ledger, await loadSourceText(ledger), mode === 'finalize' ? 'finalize' : 'provisional')
+  } catch (cause) {
+    throw FactCheckError.fromCause(afterSaveFailure(ledger, present, mode), cause)
+  }
+  if (mode !== 'finalize') return
+  // ここまで来て初めて「書き出したレポートは台帳と一致している」と言える。
+  ledger.reports_stale_since = null
+  try {
+    await saveLedger(ledger)
+  } catch (cause) {
+    throw FactCheckError.fromCause(
+      [
+        `レポート 3 形式は書けたが、完了の印を台帳に書けなかった (session_id=${ledger.session_id})。`,
+        `${LEDGER_FILE} には「レポート未完了」が残っているので、get_status は未完了のままになる。`,
+        'ディスクに書ける状態に直してから finalize を呼び直すと、同じ内容で書き直して印を消せる。',
+        '書けなかった原因はこの下の cause に入っている。',
+      ].join('\n'),
+      cause,
+    )
+  }
+}
+
+/** 台帳を保存したあとに失敗したときの説明。どこまで確定していて、次に何をするかを書く。 */
+function afterSaveFailure(ledger: Ledger, present: string[] | null, mode: ReportSyncMode): string {
+  return [
+    `台帳の変更は保存できたが、そのあとのレポート処理に失敗した (session_id=${ledger.session_id})。`,
+    `${LEDGER_FILE} は新しい内容で確定している。`,
+    mode === 'finalize'
+      ? '「レポートは最新」の印は付けていないので、get_status は未完了のままになる。'
+      : '「レポートは古い」の印が付いたままになる。',
+    present === null
+      ? 'どのレポートが残っていたかは、その確認より前に失敗したため分からない。'
+      : `失敗する前にあったレポート: [${present.join(', ') || 'なし'}]。`,
+    '**残っているレポートファイルは古い内容の可能性がある。** ディスクに書けない状態では、',
+    'その古いファイル自体に警告を書き込むこともできない。台帳と get_status のほうを見ること。',
+    '',
+    '回復の手順: 原因を直してから finalize を呼び直すと、3 形式を作り直せる。',
+    'ただし取り消しなどで判定の根拠が足りなくなっている場合、finalize は先に拒否する。',
+    'その場合は get_status の verdicts_without_basis を片付けてから finalize を呼ぶこと。',
+    '失敗の原因はこの下の cause に入っている。',
+  ].join('\n')
+}
+
+/**
+ * ファイルがあるか。**「無い」と言ってよいのは ENOENT だけ**。
+ *
+ * 以前はあらゆる stat の失敗を「無い」に畳んでいた。権限が無い・パスの途中がファイル・
+ * I/O エラーのどれも「finalize していないセッション」に見えてしまい、原因が消えていた。
+ * ENOENT 以外は原因を持ったまま投げる。
+ */
+export async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await stat(filePath)
+    return true
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException | null)?.code === 'ENOENT') return false
+    throw FactCheckError.fromCause(`ファイルの有無を確かめられない (path=${filePath})`, cause)
+  }
+}
+
+/**
+ * 台帳を書き戻す。**書いた瞬間に版は今の版になる。**
+ *
+ * 1 つ前の版のセッションでも、更新したらこの版で保存する。読める版のまま書き戻すと、
+ * 新しい項目（取り消し履歴など）が入った台帳を古い版のツールが「自分が読める版だ」と
+ * 判断して開き、取り消しを無視して集計してしまう。
+ *
+ * 逆に、**読んだだけでは版は上がらない**（loadLedger は版を書き換えない）。
+ * 読み返しただけで古い版へ戻す道を塞がないため。
+ */
 export async function saveLedger(ledger: Ledger): Promise<void> {
+  ledger.version = LEDGER_VERSION
   await writeFileAtomic(
     path.join(sessionDir(ledger.session_id), LEDGER_FILE),
     `${JSON.stringify(ledger, null, 2)}\n`,

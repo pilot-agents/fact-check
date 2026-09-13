@@ -23,39 +23,83 @@ const NOSCRIPT = [
   '<code>report.json</code> にもあります。</div></noscript>',
 ].join(' ')
 
+/**
+ * 画面の器。3 領域（主張一覧 → 元ネタ本文 → 選択中の詳細）を横に並べる。
+ *
+ * 上部は「今どれを見ているか」を決めるものだけ（表題・件数・網羅率・判定フィルター・警告）に絞る。
+ * セッション id・生成時刻・台帳 version・出どころの内訳は `<details>` の中へ入れた。初期画面の
+ * 高さを管理情報で埋めると、本文と証拠が折り返しの下に沈む（改善前は本文が 950px 下から始まっていた）。
+ *
+ * キーボードと読み上げのために置いているもの:
+ * - 先頭のスキップリンク。詳細へ行くのに一覧のボタンを全部通らせない（実測で 15 個あった）
+ * - 3 領域の見出しを h2 にして `aria-labelledby` で領域に結ぶ。見出し移動で領域を渡り歩ける
+ * - `#selection-live` は**選択が変わったことだけ**を読み上げる小さな領域。詳細ペイン自体を
+ *   aria-live にすると、主張を 1 つ移るたびに証拠の全文が読み上げられて操作できなくなる
+ * - ペイン本体に `tabindex="-1"` を付けるのはスキップリンクの飛び先にするため
+ *   （リンクで飛んだ先にフォーカスが乗らないと、次の Tab が先頭に戻る）
+ */
 const BODY = `
 <div class="wrap">
+  <a class="skip-link" href="#source-body">元ネタ本文へ移動</a>
+  <a class="skip-link" href="#detail-body">選択中の主張の詳細へ移動</a>
   <header class="topbar">
-    <h1 id="title"></h1>
-    <div class="meta" id="meta"></div>
-    <div class="chips" id="chips"></div>
-    <div class="provenance" id="provenance"></div>
+    <div class="topbar-main">
+      <div class="title-block">
+        <p class="app-title">ファクトチェック結果</p>
+        <h1 id="title"></h1>
+      </div>
+      <div class="stats" id="stats"></div>
+    </div>
+    <div class="toolbar">
+      <div class="chips" id="chips"></div>
+      <details class="session-details">
+        <summary>セッションの詳細</summary>
+        <div class="session-details-body">
+          <dl class="kv" id="meta"></dl>
+          <div class="provenance" id="provenance"></div>
+        </div>
+      </details>
+      <div id="exclusions"></div>
+    </div>
     <div id="global-warn"></div>
   </header>
   ${NOSCRIPT}
-  <section class="attention-wrap">
-    <h2>要確認一覧</h2>
-    <p class="attention-note" id="attention-note"></p>
-    <div id="attention-list"></div>
-  </section>
   <div class="layout">
-    <section class="pane" id="source-pane">
-      <div class="pane-head"><span>元ネタ本文</span><span class="legend" id="legend"></span></div>
-      <div class="pane-body" id="source-body"></div>
-    </section>
-    <section class="pane" id="detail-pane">
+    <nav class="pane" id="nav-pane" aria-labelledby="nav-head-label">
       <div class="pane-head">
-        <span id="detail-head-label">主張の詳細</span>
-        <span class="keyhint">j / k または ↑ ↓ で前後の主張へ</span>
+        <h2 id="nav-head-label">主張</h2>
+        <span class="pane-head-note" id="nav-count"></span>
       </div>
-      <div class="pane-body" id="detail-body"></div>
+      <div class="pane-body" id="nav-body"></div>
+    </nav>
+    <section class="pane" id="source-pane" aria-labelledby="source-head-label">
+      <div class="pane-head">
+        <h2 id="source-head-label">元ネタ本文</h2>
+        <span class="legend" id="legend"></span>
+      </div>
+      <div class="pane-body" id="source-body" tabindex="-1"></div>
+    </section>
+    <section class="pane" id="detail-pane" aria-labelledby="detail-head-label">
+      <div class="pane-head">
+        <h2 id="detail-head-label">主張の詳細</h2>
+        <span class="stepper">
+          <button type="button" id="prev-claim" title="前の主張へ (k / ↑)">‹ 前</button>
+          <span id="claim-position" class="position"></span>
+          <button type="button" id="next-claim" title="次の主張へ (j / ↓)">次 ›</button>
+        </span>
+      </div>
+      <div class="pane-body" id="detail-body" tabindex="-1"></div>
     </section>
   </div>
+  <p id="selection-live" class="visually-hidden" role="status" aria-live="polite"></p>
   <div id="printAll" class="print-only"></div>
-  <div id="lightbox" hidden>
-    <span class="lightbox-hint">クリックまたは Esc で閉じる</span>
+  <dialog id="lightbox" aria-label="スクリーンショットの原寸表示">
+    <div class="lightbox-bar">
+      <span class="lightbox-hint" id="lightbox-caption"></span>
+      <button type="button" id="lightbox-close">閉じる (Esc)</button>
+    </div>
     <img id="lightbox-img" alt="">
-  </div>
+  </dialog>
 </div>`
 
 export function renderHtml(payload: ViewerPayload): string {

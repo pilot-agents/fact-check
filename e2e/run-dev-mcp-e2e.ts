@@ -1,10 +1,12 @@
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { McpError, ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
 import { CHILD_DOWN_CODE, RESTART_INTERRUPTED_CODE } from '../scripts/dev-mcp/shim-core.js'
+import { startFixtureServer } from './fixtures/serve-fixtures.js'
+import { callTool } from './mcp/call-tool.js'
 
 /**
  * `pnpm dev:mcp`（ホットリロード用のシム）の end-to-end 検証。
@@ -37,12 +39,21 @@ const EXPECTED_TOOLS = [
   'finalize',
   'get_status',
   'mark_non_claim',
+  'read_source_segments',
   'register_claim',
   'register_segments',
+  'revise_record',
   'set_verdict',
   'start_session',
   'submit_agent_capture',
 ]
+
+/**
+ * ハイライト画像の回帰確認に使う元ネタ。引用は固定ページ (sample-article.html) に実在する文にする。
+ */
+const IMAGE_SOURCE_TEXT = '営業利益は前年比 95% にとどまった。'
+const IMAGE_QUOTE = '営業利益は前年比 95% にとどまり、前年を下回りました。'
+const IMAGE_PDF_PAGES = [['Fixture page', 'This page is served from localhost only.']]
 
 let failures = 0
 
@@ -282,9 +293,95 @@ async function checkRealServerThroughPnpm(): Promise<string[]> {
       status.isError === true,
       '存在しない session_id が実サーバーのエラーとして返る',
     )
+    await checkHighlightImage(connection.client)
     return connection.stderr
   } finally {
     await connection.close()
+  }
+}
+
+/**
+ * ハイライト画像が tsx 実行下でも作れることを、実際の証拠取得と引用添付で確かめる。
+ *
+ * **これは dist を叩く run-e2e.ts では捕まえられない種類の壊れ方に対する回帰確認。**
+ * tsx (esbuild の keepNames) は名前の付く関数式を `__name(...)` で包む。Playwright は
+ * ページへ渡す関数を toString して eval するので、`__name` が未定義のページ側で
+ * ReferenceError になる。tsc 出力にはこの包みが無いため、dist だけを叩く e2e は通ってしまい、
+ * 実運用（.mcp.json は pnpm dev:mcp = tsx で起動する）でだけ画像が全滅した。
+ *
+ * ついでに「取得元を止めても画像が作れる」ことも見る。画像は取得時に保存したスナップショットから
+ * 作るので、固定ページの配信を止めた後でも成功するのが正しい。
+ */
+async function checkHighlightImage(client: Client): Promise<void> {
+  log('\n[7] tsx 実行下でハイライト画像が作れる')
+  const fixture = await startFixtureServer(IMAGE_PDF_PAGES)
+  try {
+    const started = await callTool(client, 'start_session', {
+      source: { type: 'text', text: IMAGE_SOURCE_TEXT },
+      title: 'dev-mcp e2e',
+    })
+    check('start_session が通る', started.ok, started.ok ? '' : started.text)
+    if (!started.ok) return
+    const sessionId = started.data.session_id as string
+
+    const claim = await callTool(client, 'register_claim', {
+      session_id: sessionId,
+      start: 0,
+      end: IMAGE_SOURCE_TEXT.length,
+      claim: '営業利益は前年比 95% にとどまった',
+    })
+    check('register_claim が通る', claim.ok, claim.ok ? '' : claim.text)
+
+    const evidence = await callTool(client, 'fetch_evidence', {
+      session_id: sessionId,
+      source: { type: 'url', url: fixture.articleUrl },
+      discovered_via: 'cited_in_source',
+      find: '営業利益',
+    })
+    check('fetch_evidence が通る', evidence.ok, evidence.ok ? '' : evidence.text)
+    if (!evidence.ok) return
+    const found = evidence.data.find as { found: boolean; occurrences: number } | null
+    check('find が一致箇所を返す', found?.found === true && found.occurrences > 0, JSON.stringify(found))
+
+    // 取得が済んだら配信を止める。ここから先でネットワークに出ていたら失敗するはず。
+    await fixture.close()
+    log(`固定ページ配信サーバーを停止した: ${fixture.articleUrl}`)
+
+    const attached = await callTool(client, 'attach_evidence', {
+      session_id: sessionId,
+      claim_id: claim.data.claim_id,
+      evidence_id: evidence.data.evidence_id,
+      quote: IMAGE_QUOTE,
+      relation: 'contradicts',
+      rationale: '証拠は 95% で、元ネタの主張と照合するための引用',
+    })
+    check('attach_evidence が通る', attached.ok, attached.ok ? '' : attached.text)
+    if (!attached.ok) return
+    check(
+      'tsx 実行下でもハイライト画像が作れる（__name の回帰確認）',
+      typeof attached.data.screenshot_path === 'string' && attached.data.screenshot_note === null,
+      `${String(attached.data.screenshot_path)} / 但し書き=${String(attached.data.screenshot_note)}`,
+    )
+    check(
+      '取得元を止めた後でも保存済み HTML から描かれている',
+      attached.data.screenshot_source === 'saved_html',
+      String(attached.data.screenshot_source),
+    )
+    const shot = path.join(FACT_CHECK_DIR, sessionId, String(attached.data.screenshot_path))
+    const bytes = await stat(shot).then(
+      (info) => info.size,
+      () => -1,
+    )
+    check('画像が実ファイルとして保存されている', bytes > 1000, `${shot} (${bytes} bytes)`)
+
+    const page = await callTool(client, 'read_source_segments', { session_id: sessionId })
+    check(
+      'read_source_segments がシム越しに呼べる',
+      page.ok && Array.isArray(page.data.segments),
+      page.ok ? `候補 ${String(page.data.segment_total)} 件` : page.text,
+    )
+  } finally {
+    await fixture.close()
   }
 }
 

@@ -1,3 +1,4 @@
+import { effectiveAttachments, effectiveRecords } from '../../session/ledger-effective.js'
 import type { AttachmentLike, EvidenceLike, LedgerLike } from '../../session/ledger-like.js'
 import type { LedgerSummary } from '../../session/ledger-summary.js'
 import type { Attachment, DiscoveredVia, Evidence, Ledger } from '../../session/ledger-types.js'
@@ -21,11 +22,29 @@ export type ViewerLedger = Omit<Ledger, 'evidence' | 'attachments'> & {
   attachments: Attachment[]
 }
 
+/**
+ * 今も有効な記録の id。**有効かどうかの規則はサーバー側にしか無い**（ledger-effective.ts）。
+ *
+ * 以前はビューアの JavaScript が同じ規則を書き写していた。同じことを 2 つの言語で書けば、
+ * 片方だけ直したときに画面と集計が静かに食い違う（「唯一の場所」と書いたコメントの隣で
+ * 複製が動いていた）。ブラウザは**結果の id 集合を受け取って描くだけ**にする。
+ *
+ * 取り消された記録そのものは `ledger` に残す（履歴の節がそれを読む）。
+ */
+export type EffectiveIds = {
+  claims: string[]
+  non_claims: string[]
+  evidence: string[]
+  attachments: string[]
+}
+
 export type ViewerPayload = {
   generated_at: string
   summary: LedgerSummary
   attention: AttentionItem[]
   ledger: ViewerLedger
+  /** 今も有効な記録の id。ブラウザはこれで絞り込む */
+  effective: EffectiveIds
   /** 元ネタ本文の全文。左ペインはこれを塗り分けて表示する */
   source_text: string
   /** 本文を「重なりの状態が変わらない区間」に割ったもの */
@@ -40,20 +59,26 @@ export function buildViewerPayload(args: {
   sourceText: string
 }): ViewerPayload {
   const ledger = normalizeLedger(args.ledger)
+  const liveClaims = effectiveRecords(ledger.exclusions, 'claim', ledger.claims)
+  const liveNonClaims = effectiveRecords(ledger.exclusions, 'non_claim', ledger.non_claims)
   return {
     generated_at: args.generatedAt,
     summary: args.summary,
     attention: args.attention,
     ledger,
+    effective: {
+      claims: liveClaims.map((claim) => claim.id),
+      non_claims: liveNonClaims.map((nonClaim) => nonClaim.id),
+      evidence: effectiveRecords(ledger.exclusions, 'evidence', ledger.evidence).map((e) => e.id),
+      attachments: effectiveAttachments(ledger).map((attachment) => attachment.id),
+    },
     source_text: args.sourceText,
+    // 塗り分けも有効な範囲だけ。取り消した範囲を塗り続けると、網羅率（取り消しを引いた値）と
+    // 本文の見た目が食い違い、「埋まっているのに未処理と言われる」ように見える。
     spans: buildTextSpans(
       args.sourceText.length,
-      ledger.claims.map((claim) => ({ id: claim.id, start: claim.start, end: claim.end })),
-      ledger.non_claims.map((nonClaim) => ({
-        id: nonClaim.id,
-        start: nonClaim.start,
-        end: nonClaim.end,
-      })),
+      liveClaims.map((claim) => ({ id: claim.id, start: claim.start, end: claim.end })),
+      liveNonClaims.map((n) => ({ id: n.id, start: n.start, end: n.end })),
     ),
   }
 }
@@ -69,6 +94,10 @@ function normalizeLedger(ledger: LedgerLike): ViewerLedger {
     non_claims: ledger.non_claims,
     evidence: ledger.evidence.map(normalizeEvidence),
     attachments: ledger.attachments.map(normalizeAttachment),
+    // 取り消し履歴を持たない台帳は「取り消し無し」。ビューア側で undefined を
+    // 「履歴が無い」と「読み込めていない」に読み分けさせない。
+    exclusions: ledger.exclusions ?? [],
+    reports_stale_since: ledger.reports_stale_since ?? null,
   }
 }
 
@@ -78,9 +107,15 @@ function normalizeEvidence(evidence: EvidenceLike): ViewerEvidence {
     discovered_via: evidence.discovered_via ?? null,
     discovery_note: evidence.discovery_note ?? null,
     pdf: evidence.pdf ?? null,
+    term_check: evidence.term_check ?? null,
   }
 }
 
 function normalizeAttachment(attachment: AttachmentLike): Attachment {
-  return { ...attachment, pdf_page: attachment.pdf_page ?? null }
+  return {
+    ...attachment,
+    pdf_page: attachment.pdf_page ?? null,
+    screenshot_source: attachment.screenshot_source ?? null,
+    screenshot_attempts: attachment.screenshot_attempts ?? [],
+  }
 }
