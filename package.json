@@ -4,7 +4,7 @@
     "access": "public",
     "provenance": true
   },
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "MCP server that records and checks an AI agent's fact-checking work: quotes must be found verbatim in fetched evidence, coverage is computed from the source text, and the report is generated from the ledger - not from what the agent claims. It does not judge whether a claim is true.",
   "keywords": [
     "mcp",
