@@ -346,7 +346,16 @@ figure.shot figcaption { color: var(--sub); font-size: .76rem; margin-top: .25re
   #title { white-space: normal; overflow: visible; }
   .print-only { display: block; }
   /* 印刷は画面の絞り込みを引き継がない。紙は「全部」が要る。 */
-  .print-claim { break-inside: avoid; border-top: 1px solid var(--line); padding-top: .5rem; margin-top: .8rem; }
+  .print-claim { border-top: 1px solid var(--line); padding-top: .5rem; margin-top: .8rem; }
+  /*
+   * 主張 1 件は紙 1 枚より高いことが多い（画像だけで 9cm × 証拠の件数）。主張ごと改ページを
+   * 抑止すると、入りきらない主張が次のページへ送られて 1 ページ目が見出しだけで終わる（実測）。
+   * 証拠 1 件ごとの抑止でも、カードが紙の 3/4 を占めるので毎ページ下 1/4 が空く（実測、8 ページ）。
+   * 抑止は「見出しが単独で紙の末尾に残らない」「引用文・管理情報の表・画像 1 枚が途中で切れない」の
+   * 単位にかけ、証拠カード自体は途中で切れてよいことにする。
+   */
+  #printAll h2, .print-claim .detail-head, .print-claim .claim-text, .print-claim h4 { break-after: avoid; }
+  .print-claim blockquote, .print-claim dl.kv, figure.shot { break-inside: avoid; }
   .print-nonclaim { break-inside: avoid; border-top: 1px dotted var(--line); padding-top: .35rem; margin-top: .5rem; }
   .print-nonclaim h3 { font-size: 1rem; margin: 0 0 .2rem; }
   .exclusion { break-inside: avoid; }
