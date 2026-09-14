@@ -332,6 +332,110 @@ describe('finalize の拒否条件', () => {
   })
 })
 
+describe('export_report: レポートの持ち出し', () => {
+  /** 判定まで済ませたセッション。finalize は呼ばない（呼ぶかどうかはテスト側で決める）。 */
+  async function verifiedSession(client: Client): Promise<string> {
+    const { sessionId, claimId } = await startCoveredSession(client)
+    await attachLocalEvidence(client, sessionId, claimId, '売上は前年比 120% となった', 'supports')
+    await call(client, 'set_verdict', {
+      session_id: sessionId,
+      claim_id: claimId,
+      verdict: 'verified',
+      rationale: '証拠の引用どおり',
+    })
+    return sessionId
+  }
+
+  test('finalize 前でも書き出せるが、暫定である旨の警告が付き、台帳は変わらない', async () => {
+    const client = await connectClient()
+    const sessionId = await verifiedSession(client)
+    const ledgerPath = path.join(process.env.FACT_CHECK_DIR ?? '', sessionId, 'ledger.json')
+    const ledgerBefore = await readFile(ledgerPath, 'utf8')
+    const outputPath = path.join(baseDir, 'exported', `${sessionId}-provisional.html`)
+
+    const result = await call(client, 'export_report', {
+      session_id: sessionId,
+      format: 'html',
+      output_path: outputPath,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.data).toMatchObject({
+      session_id: sessionId,
+      format: 'html',
+      path: outputPath,
+      inlined_images: 0,
+    })
+    expect(typeof result.data.reports_stale_since).toBe('string')
+    expect(String(result.data.warning)).toContain('finalize の検証を通していない暫定のもの')
+    const payload = readEmbeddedJson(await readFile(outputPath, 'utf8'), 'fact-check-data') as ViewerPayload
+    expect(payload.ledger.reports_stale_since).toBe(result.data.reports_stale_since)
+    expect(payload.assets).toEqual({})
+    // 読み取りだけの操作。台帳ファイルは 1 バイトも変わらない
+    expect(await readFile(ledgerPath, 'utf8')).toBe(ledgerBefore)
+  })
+
+  test('finalize 後は警告なしで書き出せる', async () => {
+    const client = await connectClient()
+    const sessionId = await verifiedSession(client)
+    expect((await call(client, 'finalize', { session_id: sessionId })).ok).toBe(true)
+    const outputPath = path.join(baseDir, 'exported', `${sessionId}.html`)
+
+    const result = await call(client, 'export_report', {
+      session_id: sessionId,
+      format: 'html',
+      output_path: outputPath,
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.data).toMatchObject({ reports_stale_since: null, warning: null })
+    expect(await readFile(outputPath, 'utf8')).toContain('<!doctype html>')
+  })
+
+  test.each([
+    { name: '相対パス', output_path: 'report.html', expected: '絶対パスで指定すること' },
+    {
+      name: '拡張子が形式と違う',
+      output_path: '/tmp/report.pdf',
+      expected: '拡張子 .html / .htm にすること',
+    },
+  ])('入力の不備は書き出す前に拒否する: $name', async ({ output_path, expected }) => {
+    const client = await connectClient()
+    const sessionId = await verifiedSession(client)
+    const result = await call(client, 'export_report', { session_id: sessionId, format: 'html', output_path })
+    expect(result.ok).toBe(false)
+    expect(result.text).toContain(expected)
+  })
+
+  test('既にあるファイルは overwrite=true が無ければ置き換えない', async () => {
+    const client = await connectClient()
+    const sessionId = await verifiedSession(client)
+    const outputPath = path.join(baseDir, 'exported', `${sessionId}-twice.html`)
+    const first = await call(client, 'export_report', {
+      session_id: sessionId,
+      format: 'html',
+      output_path: outputPath,
+    })
+    expect(first.ok).toBe(true)
+
+    const refused = await call(client, 'export_report', {
+      session_id: sessionId,
+      format: 'html',
+      output_path: outputPath,
+    })
+    expect(refused.ok).toBe(false)
+    expect(refused.text).toContain('出力先に既にファイルがある')
+
+    const replaced = await call(client, 'export_report', {
+      session_id: sessionId,
+      format: 'html',
+      output_path: outputPath,
+      overwrite: true,
+    })
+    expect(replaced.ok).toBe(true)
+  })
+})
+
 describe('submit_agent_capture', () => {
   test('provenance は agent_captured になり、レポートに警告が出る', async () => {
     const client = await connectClient()

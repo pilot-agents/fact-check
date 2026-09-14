@@ -4,6 +4,7 @@ import type { LedgerSummary } from '../../session/ledger-summary.js'
 import type { Attachment, DiscoveredVia, Evidence, Ledger } from '../../session/ledger-types.js'
 import { buildTextSpans, type TextSpan } from '../../source-text/spans.js'
 import type { AttentionItem } from '../attention.js'
+import type { InlineAssets } from './inline-assets.js'
 
 /**
  * ビューア (report.html) に埋め込むデータ。中身は report.json と同じ台帳に、
@@ -49,6 +50,12 @@ export type ViewerPayload = {
   source_text: string
   /** 本文を「重なりの状態が変わらない区間」に割ったもの */
   spans: TextSpan[]
+  /**
+   * 画像の相対パス → data URI。セッションの外へ持ち出す HTML だけが持ち、
+   * セッションディレクトリに置く report.html では空（相対パスのまま参照する）。
+   * 台帳の `screenshot_path` は書き換えず、ビューアが `img.src` を組むときにだけ引く。
+   */
+  assets: InlineAssets
 }
 
 export function buildViewerPayload(args: {
@@ -57,6 +64,7 @@ export function buildViewerPayload(args: {
   summary: LedgerSummary
   attention: AttentionItem[]
   sourceText: string
+  assets: InlineAssets
 }): ViewerPayload {
   const ledger = normalizeLedger(args.ledger)
   const liveClaims = effectiveRecords(ledger.exclusions, 'claim', ledger.claims)
@@ -80,6 +88,7 @@ export function buildViewerPayload(args: {
       liveClaims.map((claim) => ({ id: claim.id, start: claim.start, end: claim.end })),
       liveNonClaims.map((n) => ({ id: n.id, start: n.start, end: n.end })),
     ),
+    assets: args.assets,
   }
 }
 

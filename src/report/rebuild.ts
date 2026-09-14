@@ -54,6 +54,7 @@ export async function rebuildReportHtml(sessionDirectory: string): Promise<Rebui
     summary,
     attention: buildAttention(parsed.ledger),
     sourceText,
+    assets: {},
   })
   const htmlPath = path.join(directory, REPORT_HTML)
   try {

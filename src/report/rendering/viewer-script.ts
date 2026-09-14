@@ -42,6 +42,15 @@ export const VIEWER_SCRIPT = `
   var labels = readJson('fact-check-labels')
   var ledger = data.ledger
   var exclusions = ledger.exclusions || []
+  /**
+   * 画像の相対パス → data URI。単体で持ち出す HTML だけが持つ。無ければ相対パスのまま
+   * （セッションディレクトリごと渡す report.html）。台帳のパスは書き換えず、src を組むときだけ引く。
+   */
+  var assets = data.assets || {}
+
+  function imageSrc(relativePath) {
+    return Object.prototype.hasOwnProperty.call(assets, relativePath) ? assets[relativePath] : relativePath
+  }
   var claimById = {}
   var attachmentsFor = {}
   var evidenceById = {}
@@ -811,7 +820,7 @@ export const VIEWER_SCRIPT = `
       )
       zoom.disabled = true
     })
-    image.src = attachment.screenshot_path
+    image.src = imageSrc(attachment.screenshot_path)
     figure.appendChild(image)
     figure.appendChild(
       el(

@@ -691,6 +691,73 @@ async function checkViewerPage(
   }
 }
 
+/**
+ * 持ち出し用の HTML を、**セッションディレクトリの外**から file:// で開く。
+ *
+ * report.html と違って画像は相対パスでは辿れない場所にあるので、画像が実際に表示されれば
+ * 埋め込みが効いている。文字列に data: が含まれるかを見るだけでは、ビューアが src を組む
+ * 段で相対パスに戻していても気づけない。
+ */
+async function checkExportedHtml(
+  htmlPath: string,
+  expected: { verifiedClaim: string; screenshotPath: string; claimCount: number },
+): Promise<void> {
+  const browser = await chromium.launch({ headless: true })
+  try {
+    const context = await browser.newContext({ viewport: { width: 1400, height: 900 } })
+    const page = await context.newPage()
+    const problems: string[] = []
+    page.on('console', (message) => {
+      if (message.type() === 'error') problems.push(message.text())
+    })
+    page.on('pageerror', (error) => {
+      problems.push(`pageerror: ${error.message}\n${error.stack ?? '(stack なし)'}`)
+    })
+    await page.goto(pathToFileURL(htmlPath).href, { waitUntil: 'load' })
+    check(
+      '持ち出した HTML の描画コードが例外なく走る',
+      problems.length === 0,
+      problems.join('\n---\n') || 'エラーなし',
+    )
+    check(
+      '持ち出した HTML にも全主張が出る',
+      (await page.locator('#nav-body .nav-item').count()) === expected.claimCount,
+      `${await page.locator('#nav-body .nav-item').count()} / ${expected.claimCount} 件`,
+    )
+    await page.click(`#source-body .seg-claim[data-claim="${expected.verifiedClaim}"]`)
+    const shotSrc = (await page.getAttribute('#detail-body img.shot', 'src')) ?? ''
+    let loadProblem: string | null = null
+    try {
+      await page.waitForFunction(
+        () => {
+          const image = document.querySelector('#detail-body img.shot')
+          return image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0
+        },
+        undefined,
+        { timeout: 15_000 },
+      )
+    } catch (cause) {
+      loadProblem = cause instanceof Error ? cause.message : String(cause)
+    }
+    check(
+      'セッションディレクトリの外でも画像が data URI から実際に表示される',
+      shotSrc.startsWith('data:image/png;base64,') && loadProblem === null,
+      `src=${shotSrc.slice(0, 40)}… / 読み込み=${loadProblem ?? '成功'}`,
+    )
+    // 表示上のパスは台帳の相対パスのまま（data URI に書き換えていない）。
+    const embedded = readEmbeddedJson(await readFile(htmlPath, 'utf8'), 'fact-check-data') as ViewerPayload
+    check(
+      '台帳の screenshot_path は相対パスのまま、埋め込みは assets に別で持つ',
+      embedded.ledger.attachments.some((a) => a.screenshot_path === expected.screenshotPath) &&
+        Object.keys(embedded.assets).includes(expected.screenshotPath),
+      `assets ${Object.keys(embedded.assets).length} 件`,
+    )
+    await context.close()
+  } finally {
+    await browser.close()
+  }
+}
+
 /** `pnpm viewer` を実際に起動して、一覧とレポートが配られることを確かめる。 */
 async function checkViewerServer(sessionId: string): Promise<void> {
   const viewer = spawn('pnpm', ['viewer', '--port', '0'], {
@@ -788,6 +855,7 @@ async function main(): Promise<void> {
       names.join(',') ===
         [
           'attach_evidence',
+          'export_report',
           'fetch_evidence',
           'finalize',
           'get_status',
@@ -1647,6 +1715,55 @@ async function main(): Promise<void> {
       nonClaimCount,
       exclusionCount,
     })
+
+    log('\n[11c] export_report でレポートを 1 ファイルの HTML / PDF として持ち出す')
+    const exportDir = path.join(WORK_DIR, 'exported')
+    const pdfPath = path.join(exportDir, 'fact-check.pdf')
+    const exportedPdf = await callTool(client, 'export_report', {
+      session_id: sessionId,
+      format: 'pdf',
+      output_path: pdfPath,
+    })
+    check('PDF を書き出せる', exportedPdf.ok, exportedPdf.ok ? '' : exportedPdf.text)
+    if (exportedPdf.ok) {
+      const pdfBytes = await readFile(pdfPath)
+      check(
+        '書き出したファイルが PDF として実在し、画像を埋め込んでいる',
+        pdfBytes.subarray(0, 5).toString('latin1') === '%PDF-' &&
+          pdfBytes.length === exportedPdf.data.bytes &&
+          Number(exportedPdf.data.inlined_images) >= 1,
+        `${pdfBytes.length} バイト / 画像 ${String(exportedPdf.data.inlined_images)} 件`,
+      )
+      check(
+        'finalize 済みなので暫定の警告は付かない',
+        exportedPdf.data.reports_stale_since === null && exportedPdf.data.warning === null,
+        String(exportedPdf.data.warning),
+      )
+    }
+    const refusedOverwrite = await callTool(client, 'export_report', {
+      session_id: sessionId,
+      format: 'pdf',
+      output_path: pdfPath,
+    })
+    check(
+      '同じ出力先へは overwrite 無しでは書かない',
+      !refusedOverwrite.ok && refusedOverwrite.text.includes('出力先に既にファイルがある'),
+      refusedOverwrite.text.split('\n')[0] ?? '',
+    )
+    const exportedHtmlPath = path.join(exportDir, 'standalone', 'fact-check.html')
+    const exportedHtml = await callTool(client, 'export_report', {
+      session_id: sessionId,
+      format: 'html',
+      output_path: exportedHtmlPath,
+    })
+    check('HTML を書き出せる', exportedHtml.ok, exportedHtml.ok ? '' : exportedHtml.text)
+    if (exportedHtml.ok) {
+      await checkExportedHtml(exportedHtmlPath, {
+        verifiedClaim: String(claimA.data.claim_id),
+        screenshotPath: String(highlightShot),
+        claimCount: 4,
+      })
+    }
 
     log('\n[12] pnpm viewer でセッション一覧を配る')
     await checkViewerServer(sessionId)

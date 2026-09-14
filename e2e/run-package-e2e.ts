@@ -33,6 +33,7 @@ const EMPTY_BROWSERS_DIR = path.join(WORK_DIR, 'no-browsers')
 
 const EXPECTED_TOOLS = [
   'attach_evidence',
+  'export_report',
   'fetch_evidence',
   'finalize',
   'get_status',

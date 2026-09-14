@@ -35,6 +35,7 @@ const SETTLE_TIMEOUT_MS = 30_000
 
 const EXPECTED_TOOLS = [
   'attach_evidence',
+  'export_report',
   'fetch_evidence',
   'finalize',
   'get_status',

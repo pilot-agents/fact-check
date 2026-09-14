@@ -53,6 +53,7 @@
     "start": "tsx src/index.ts",
     "viewer": "tsx src/viewer/main.ts",
     "report:rebuild": "tsx src/report/rebuild-cli.ts",
+    "report:export": "tsx src/report/export-cli.ts",
     "prepublishOnly": "pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm check:leaks --require-denylist"
   },
   "dependencies": {

@@ -252,6 +252,7 @@ finalize（網羅率 100% かつ全 claim 判定済み、判定の根拠が揃�
 | `revise_record` | 誤登録した claim / non_claim / evidence / attachment を理由つきで取り消す。取り消しの復元、セッション全体の保管もこれで行う | 対象の id が無い・すでに取り消し済みの二重取り消し・取り消されていないものの復元 |
 | `get_status` | 網羅率・未処理の範囲・未判定の claim・根拠が無くなった判定・取り消し履歴を返す | — |
 | `finalize` | `report.md` / `report.json` / `report.html` を書き出す | 網羅率 100% 未満・判定漏れ・claim が 0 件・**判定を支える有効な根拠が無くなっている** |
+| `export_report` | レポートを画像ごと 1 ファイルにした HTML / PDF を、指定した絶対パスへ持ち出す（台帳は変えない） | 相対パス・形式と拡張子の食い違い・出力先に既にファイルがある（`overwrite` 無し）・台帳が参照する画像が無い・PDF の描画で例外や画像の読み込み失敗があった |
 
 ### 誤登録の取り消しと復元（`revise_record`）
 
@@ -475,6 +476,7 @@ pnpm e2e:dev       # ホットリロード用の前段（pnpm dev:mcp）を MCP 
 pnpm dev:mcp       # ローカルのソースのままクライアントに繋ぐ（上記「ローカルのソースで試す」）
 pnpm viewer        # セッション一覧のローカルサーバーを起動する
 pnpm report:rebuild <session_dir>   # 既存セッションの report.html を今のビューアで作り直す
+pnpm report:export <session_dir> <output_path> [--overwrite]   # 画像ごと 1 ファイルの HTML / PDF を持ち出す
 ```
 
 `pnpm e2e` / `pnpm e2e:package` / `pnpm e2e:dev` は外部サイトには一切アクセスしません。ローカルの HTTP サーバーが配る
@@ -626,6 +628,44 @@ PC では画面の全幅を使い、上部の集計の下に主張一覧・本�
 - 全主張の詳細（画面で閉じていた管理情報やエラー全文も含む）
 - **対象外とした範囲**（理由と元ネタの該当文。`report.md` と同じ件数・同じ並び）
 - **取り消し履歴**（取り消した理由・時刻・対象と、取り消した中身）
+
+### レポートを 1 ファイルで持ち出す（`export_report` / `pnpm report:export`）
+
+`report.html` はスクリーンショットを相対パスで参照するので、そのファイルだけを別の場所へ置くと画像が
+切れます。人に渡す・別の場所に保存する・紙にするときは、**画像を中身ごと埋め込んだ 1 ファイル**を
+作ります。
+
+MCP ツールから:
+
+```jsonc
+// export_report の入力
+{ "session_id": "fc_...", "format": "pdf", "output_path": "/absolute/path/to/fact-check.pdf" }
+// 既にあるファイルを置き換えるなら "overwrite": true を足す
+```
+
+コマンドラインから（形式は出力先の拡張子で決まります）:
+
+```bash
+pnpm report:export .fact-check/fc_20260101T000000_deadbeef ~/Desktop/fact-check.html
+pnpm report:export .fact-check/fc_20260101T000000_deadbeef ~/Desktop/fact-check.pdf --overwrite
+```
+
+- **`html`** — `report.html` と同じビューアに、画像を data URI で埋め込んだもの。ファイル 1 つで
+  `file://` から開けます。画像 1 件あたり数百 KB 入るので、ファイルは `report.html` より大きくなります
+- **`pdf`** — 同じ HTML を Chromium の印刷レイアウト（上記「印刷（PDF 保存）」と同じ内容。全主張・
+  対象外の範囲・取り消し履歴を全件）で A4 にしたもの。ヘッドレスブラウザが要ります
+  （[必要なもの](#必要なもの)）。日本語のフォントは実行環境のものを使うので、フォントの無い
+  環境では文字が出ません
+
+台帳は変えません（読み取りだけの操作です）。`finalize` を通していないセッションでも書き出せますが、
+その内容には「finalize を通していない暫定表示」の断りが焼き込まれ、応答にも `warning` が付きます。
+正式なレポートにするなら `finalize` を通してから書き出し直してください。
+
+出力先は**絶対パス**で指定します。親ディレクトリが無ければ作ります。既にファイルがある場所へは
+`overwrite: true`（CLI では `--overwrite`）を付けない限り書きません。台帳が参照する画像ファイルが
+欠けているときは、欠けている全件を挙げて拒否し、画像の切れたファイルは作りません。PDF では、
+ビューアの描画で例外が出たり画像を読み込めなかったりしたときも同じく PDF を書かずに拒否します
+（白紙のページを成功として渡さないため）。
 
 ### セッション一覧（`pnpm viewer`）
 

@@ -69,7 +69,9 @@ export async function writeReport(
     'report.md': renderMarkdown(rendered, summary),
     'report.json': `${JSON.stringify(json, null, 2)}\n`,
     'report.html': renderHtml(
-      buildViewerPayload({ generatedAt, ledger: rendered, summary, attention, sourceText }),
+      // 画像は相対パスのまま。セッションディレクトリごと渡す前提のファイルで、単体で持ち出す
+      // 形（画像を埋め込む）は export_report が別に作る。
+      buildViewerPayload({ generatedAt, ledger: rendered, summary, attention, sourceText, assets: {} }),
     ),
   }
   const written: string[] = []

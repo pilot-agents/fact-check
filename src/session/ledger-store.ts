@@ -43,7 +43,8 @@ function newSessionId(now: Date): string {
   return `fc_${stamp}_${randomBytes(4).toString('hex')}`
 }
 
-async function writeFileAtomic(filePath: string, data: string | Uint8Array): Promise<void> {
+/** 一時ファイルに書いてから rename する。途中で落ちても半端な中身のファイルは残らない。 */
+export async function writeFileAtomic(filePath: string, data: string | Uint8Array): Promise<void> {
   const tmp = `${filePath}.${randomBytes(4).toString('hex')}.tmp`
   try {
     await writeFile(tmp, data)
